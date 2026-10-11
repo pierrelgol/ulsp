@@ -555,3 +555,141 @@ pub const query_calls = struct {
         return 1;
     }
 };
+
+/// Tree-sitter `core` functions and the registration of the four handle metatables.
+/// Each function reads its arguments, works, then pushes. Nothing here waits.
+pub const ts_calls = struct {
+    /// Creates the four metatables and adds the `ts_*` functions to the `core` table on top.
+    pub fn register(lua: *Lua) void {
+        inline for (.{
+            .{ "ts_load", load },
+            .{ "ts_language", language },
+            .{ "ts_parse", parse },
+            .{ "ts_tree", tree },
+            .{ "ts_query", query_calls.create },
+        }) |entry| {
+            lua.pushFunction(wrap(entry[1]));
+            lua.setField(-2, entry[0]);
+        }
+
+        registerMetatable(lua, LanguageBox.metatable_name, .{}, null, LanguageBox.equal);
+        registerMetatable(lua, TreeBox.metatable_name, .{
+            .{ "root", TreeBox.root },
+            .{ "text", TreeBox.text },
+        }, TreeBox.release, null);
+        registerMetatable(lua, NodeBox.metatable_name, node_calls.methods, NodeBox.release, NodeBox.equal);
+        registerMetatable(lua, QueryBox.metatable_name, query_calls.methods, QueryBox.release, null);
+    }
+
+    /// `gc` and `equal` may be null.
+    fn registerMetatable(lua: *Lua, name: [:0]const u8, comptime methods: anytype, comptime gc: anytype, comptime equal: anytype) void {
+        lua.newMetatable(name) catch unreachable;
+
+        lua.createTable(0, methods.len);
+        inline for (methods) |method| {
+            lua.pushFunction(wrap(method[1]));
+            lua.setField(-2, method[0]);
+        }
+        lua.setField(-2, "__index");
+
+        if (@TypeOf(gc) != @TypeOf(null)) {
+            lua.pushFunction(wrap(gc));
+            lua.setField(-2, "__gc");
+        }
+        if (@TypeOf(equal) != @TypeOf(null)) {
+            lua.pushFunction(wrap(equal));
+            lua.setField(-2, "__eq");
+        }
+
+        lua.pop(1);
+    }
+
+    fn load(lua: *Lua) i32 {
+        const runtime = Runtime.of(lua);
+        const name = lua.checkString(1);
+        const path = lua.checkString(2);
+
+        const loaded_language = runtime.trees.loadLanguage(name, path) catch |err| switch (err) {
+            error.CannotOpen => raise.formatted(lua, "ulsp: cannot open {s}", .{path}),
+            error.SymbolNotFound => raise.formatted(lua, "ulsp: symbol tree_sitter_{s} not found in {s}", .{ name, path }),
+            error.IncompatibleAbi => raise.formatted(lua, "ulsp: language \"{s}\" has an incompatible ABI version", .{name}),
+            error.OutOfMemory => raise.text(lua, "out of memory"),
+        };
+
+        if (!std.mem.eql(u8, loaded_language.path, path)) {
+            var buffer: [512]u8 = undefined;
+            const warning = std.fmt.bufPrint(&buffer, "ts.load: \"{s}\" is already loaded from {s}; ignoring {s}", .{ name, loaded_language.path, path }) catch &buffer;
+            runtime.log(2, warning);
+        }
+
+        LanguageBox.push(lua, loaded_language);
+
+        return 1;
+    }
+
+    fn language(lua: *Lua) i32 {
+        const runtime = Runtime.of(lua);
+        const name = lua.checkString(1);
+
+        if (runtime.trees.findLanguage(name)) |found_language| {
+            LanguageBox.push(lua, found_language);
+        } else {
+            lua.pushNil();
+        }
+
+        return 1;
+    }
+
+    fn raiseParseError(lua: *Lua, err: Trees.ParseError) noreturn {
+        switch (err) {
+            error.OutOfMemory => raise.text(lua, "out of memory"),
+            error.ParseFailed => raise.text(lua, "ulsp: parse failed"),
+        }
+    }
+
+    fn parse(lua: *Lua) i32 {
+        const runtime = Runtime.of(lua);
+        const parse_language = LanguageBox.argument(lua, runtime, 1);
+        const text = lua.checkString(2);
+
+        const shared_tree = runtime.trees.parse(parse_language, text, null) catch |err| raiseParseError(lua, err);
+        TreeBox.push(lua, shared_tree);
+        // The handle took its own reference.
+        shared_tree.release();
+        runtime.noteNativeBytes(text.len);
+
+        return 1;
+    }
+
+    fn tree(lua: *Lua) i32 {
+        const runtime = Runtime.of(lua);
+        const tree_language = LanguageBox.argument(lua, runtime, 2);
+
+        // A uri names the live document; a handle (live or snapshot) names exactly that text.
+        const document = if (lua.typeOf(1) == .userdata)
+            document_calls.documentArgument(lua, runtime, 1)
+        else
+            runtime.documents.find(lua.checkString(1)) orelse {
+                lua.pushNil();
+                return 1;
+            };
+
+        const shared_tree = runtime.trees.treeForDocument(document, tree_language) catch |err| raiseParseError(lua, err);
+        TreeBox.push(lua, shared_tree);
+        shared_tree.release();
+
+        // A snapshot's tree is not in the cache: only Lua keeps it alive, so count it for the GC.
+        if (document.is_snapshot) {
+            runtime.noteNativeBytes(document.bytes().len * 4);
+        }
+
+        return 1;
+    }
+};
+
+test "character counts utf-16 units on the line" {
+    const text = "a\u{1F600}b";
+    try std.testing.expectEqual(@as(u32, 3), node_calls.characterOnLine(text, .@"utf-16", 5, 5));
+    try std.testing.expectEqual(@as(u32, 5), node_calls.characterOnLine(text, .@"utf-8", 5, 5));
+    try std.testing.expectEqual(@as(u32, 1), node_calls.characterOnLine("ab\ncd", .@"utf-16", 4, 1));
+}
