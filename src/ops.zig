@@ -313,3 +313,147 @@ pub const OperationTable = struct {
         table.queue.putOne(table.io, .tick) catch {};
     }
 };
+
+/// A table with its own queue and environment, for the operation tests.
+pub const TestHarness = struct {
+    queue_storage: [queue_capacity]Event = undefined,
+    queue: EventQueue = undefined,
+    environ: std.process.Environ.Map,
+    table: OperationTable = undefined,
+
+    pub fn init(harness: *TestHarness) void {
+        harness.environ = .init(testing.allocator);
+        harness.queue = .init(&harness.queue_storage);
+        harness.table.init(testing.allocator, testing.io, &harness.queue, &harness.environ);
+    }
+
+    pub fn deinit(harness: *TestHarness) void {
+        harness.table.deinit();
+        harness.environ.deinit();
+    }
+
+    /// Starts `spec` in a fresh arena; the table owns it from here.
+    pub fn start(harness: *TestHarness, spec: Spec) !u64 {
+        return harness.table.start(.init(testing.allocator), spec);
+    }
+
+    pub fn startRun(harness: *TestHarness, argv: []const []const u8) !u64 {
+        return harness.start(.{ .run = .{ .argv = argv } });
+    }
+
+    /// Waits for the next worker completion and takes it; the caller destroys the operation.
+    pub fn nextCompletion(harness: *TestHarness) !*Operation {
+        const event = harness.queue.getOne(testing.io) catch unreachable;
+        const operation = event.completion;
+        harness.table.takeCompleted(operation);
+
+        return operation;
+    }
+
+    /// Waits until a sleep is due and pops it; the caller destroys the operation.
+    pub fn nextDueSleep(harness: *TestHarness) !*Operation {
+        while (true) {
+            if (harness.table.popDueTimer(harness.table.now())) |operation| {
+                return operation;
+            }
+            try testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+};
+
+const testing = std.testing;
+
+test "sleep completes" {
+    var harness: TestHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+
+    const id = try harness.start(.{ .sleep = 5 });
+    const operation = try harness.nextDueSleep();
+    defer harness.table.destroyOperation(operation);
+
+    try testing.expectEqual(id, operation.id);
+    try testing.expect(operation.result == .completed);
+    try testing.expectEqual(@as(usize, 0), harness.table.operations_by_id.count());
+}
+
+test "a due sleep wakes the loop with a tick" {
+    var harness: TestHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+
+    _ = try harness.start(.{ .sleep = 5 });
+    harness.table.armWake();
+    try testing.expect((try harness.queue.getOne(testing.io)) == .tick);
+
+    harness.table.disarmWake();
+    harness.table.destroyOperation(harness.table.popDueTimer(harness.table.now()).?);
+}
+
+test "cancel before completion leaves nothing" {
+    var harness: TestHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+
+    const id = try harness.start(.{ .sleep = 60_000 });
+    harness.table.cancel(id);
+    harness.table.cancel(id); // unknown id is ignored
+
+    try testing.expectEqual(@as(usize, 0), harness.table.operations_by_id.count());
+}
+
+test "a sleep armed after the cutoff is not due at it" {
+    var harness: TestHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+
+    const cutoff_ns = harness.table.now();
+    _ = try harness.start(.{ .sleep = 0 });
+
+    try testing.expect(harness.table.popDueTimer(cutoff_ns) == null);
+    harness.table.destroyOperation(harness.table.popDueTimer(harness.table.now()).?);
+}
+
+test "timers fire in deadline order, ties in start order, and cancel removes" {
+    var harness: TestHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+
+    const slowest = try harness.start(.{ .sleep = 120 });
+    const fastest = try harness.start(.{ .sleep = 10 });
+    const middle = try harness.start(.{ .sleep = 60 });
+    const canceled = try harness.start(.{ .sleep = 600_000 });
+    harness.table.cancel(canceled);
+    harness.table.cancel(canceled);
+    try testing.expectEqual(@as(usize, 3), harness.table.timers.items.len);
+
+    var fired_order: [3]u64 = undefined;
+    for (&fired_order) |*fired_id| {
+        const operation = try harness.nextDueSleep();
+        fired_id.* = operation.id;
+        harness.table.destroyOperation(operation);
+    }
+    try testing.expectEqualSlices(u64, &.{ fastest, middle, slowest }, &fired_order);
+    try testing.expectEqual(@as(usize, 0), harness.table.operations_by_id.count());
+
+    // Ties: one deadline, start order, whatever the wake order of any task.
+    harness.table.timers.clearRetainingCapacity();
+    const shared_deadline_ns = harness.table.now() + 10 * std.time.ns_per_ms;
+    var tied_operations: [3]*Operation = undefined;
+    for (&tied_operations, 0..) |*tied_operation, index| {
+        tied_operation.* = try testing.allocator.create(Operation);
+        tied_operation.*.* = .{
+            .id = 100 + index,
+            .arena = .init(testing.allocator),
+            .spec = .{ .sleep = 0 },
+            .table = &harness.table,
+        };
+        try harness.table.operations_by_id.put(testing.allocator, tied_operation.*.id, tied_operation.*);
+        try harness.table.timers.append(testing.allocator, .{ .deadline_ns = shared_deadline_ns, .operation = tied_operation.* });
+    }
+    for (0..3) |index| {
+        const operation = harness.table.popDueTimer(shared_deadline_ns).?;
+        try testing.expectEqual(@as(u64, 100 + index), operation.id);
+        harness.table.destroyOperation(operation);
+    }
+}
