@@ -65,3 +65,36 @@ pub fn release(document: *Document) void {
     document.text.deinit(gpa);
     gpa.destroy(document);
 }
+
+pub fn bytes(document: *const Document) []const u8 {
+    return document.text.items;
+}
+
+pub fn setText(document: *Document, new_text: []const u8) Allocator.Error!void {
+    document.text.clearRetainingCapacity();
+    try document.text.appendSlice(document.gpa, new_text);
+}
+
+pub fn replace(document: *Document, start: usize, end: usize, new_text: []const u8) Allocator.Error!Edit {
+    const start_point = document.pointAtOffset(start);
+    const old_end_point = document.pointAtOffset(end);
+
+    try document.text.replaceRange(document.gpa, start, end - start, new_text);
+
+    var new_end_point = start_point;
+    if (std.mem.lastIndexOfScalar(u8, new_text, '\n')) |last_newline| {
+        new_end_point.row += @intCast(std.mem.count(u8, new_text, "\n"));
+        new_end_point.column = @intCast(new_text.len - last_newline - 1);
+    } else {
+        new_end_point.column += @intCast(new_text.len);
+    }
+
+    return .{
+        .start_byte = start,
+        .old_end_byte = end,
+        .new_end_byte = start + new_text.len,
+        .start = start_point,
+        .old_end = old_end_point,
+        .new_end = new_end_point,
+    };
+}
