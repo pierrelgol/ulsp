@@ -170,3 +170,174 @@ pub const uri_calls = struct {
         return 1;
     }
 };
+
+/// `core.op_*`: start and cancel operations. A raise skips `defer`, so every
+/// arena is freed before one.
+pub const operation_calls = struct {
+    const RunSpecError = error{ BadCommand, BadStdin, BadCwd, BadEnvironment, OutOfMemory };
+
+    pub fn startSleep(lua: *Lua) i32 {
+        const runtime = Runtime.of(lua);
+        const milliseconds = lua.checkNumber(1);
+        if (std.math.isNan(milliseconds) or milliseconds < 0) {
+            lua.argError(1, "expected a number >= 0");
+        }
+
+        return startOperation(lua, runtime, .init(runtime.gpa), .{ .sleep = @intFromFloat(@min(milliseconds, operations.max_sleep_ms)) });
+    }
+
+    /// `read`, `stat` and `list` take one path.
+    pub fn startPathOperation(comptime kind: []const u8) fn (*Lua) i32 {
+        return struct {
+            fn start(lua: *Lua) i32 {
+                const runtime = Runtime.of(lua);
+                const path = lua.checkString(1);
+
+                var arena: Arena = .init(runtime.gpa);
+                const spec = @unionInit(operations.Spec, kind, copyOrRaise(lua, &arena, path));
+
+                return startOperation(lua, runtime, arena, spec);
+            }
+        }.start;
+    }
+
+    pub fn startWrite(lua: *Lua) i32 {
+        const runtime = Runtime.of(lua);
+        const path = lua.checkString(1);
+        const data = lua.checkString(2);
+
+        var arena: Arena = .init(runtime.gpa);
+        const spec: operations.Spec = .{ .write = .{
+            .path = copyOrRaise(lua, &arena, path),
+            .data = copyOrRaise(lua, &arena, data),
+        } };
+
+        return startOperation(lua, runtime, arena, spec);
+    }
+
+    pub fn startRun(lua: *Lua) i32 {
+        const runtime = Runtime.of(lua);
+        lua.checkType(1, .table);
+
+        var arena: Arena = .init(runtime.gpa);
+        const spec = readRunSpec(lua, arena.allocator()) catch |err| {
+            arena.deinit();
+            raise.text(lua, runSpecErrorText(err));
+        };
+
+        return startOperation(lua, runtime, arena, .{ .run = spec });
+    }
+
+    pub fn cancel(lua: *Lua) i32 {
+        const runtime = Runtime.of(lua);
+        const id = lua.checkInteger(1);
+
+        if (id > 0) {
+            runtime.operation_table.cancel(@intCast(id));
+        }
+
+        return 0;
+    }
+
+    /// Takes ownership of `arena`, which holds the memory of `spec`.
+    fn startOperation(lua: *Lua, runtime: *Runtime, arena: Arena, spec: operations.Spec) i32 {
+        const id = runtime.operation_table.start(arena, spec) catch |err| {
+            raise.formatted(lua, "ulsp: cannot start operation: {s}", .{@errorName(err)});
+        };
+        lua.pushInteger(@intCast(id));
+
+        return 1;
+    }
+
+    /// Copies `text` into `arena`; frees the arena before raising.
+    fn copyOrRaise(lua: *Lua, arena: *Arena, text: []const u8) []const u8 {
+        return arena.allocator().dupe(u8, text) catch {
+            arena.deinit();
+            raise.text(lua, "out of memory");
+        };
+    }
+
+    fn runSpecErrorText(err: RunSpecError) []const u8 {
+        return switch (err) {
+            error.BadCommand => "ulsp.process.run: cmd must be an array of strings with at least one element",
+            error.BadStdin => "ulsp.process.run: stdin must be a string",
+            error.BadCwd => "ulsp.process.run: cwd must be a string",
+            error.BadEnvironment => "ulsp.process.run: env must be a table of strings",
+            error.OutOfMemory => "out of memory",
+        };
+    }
+
+    /// Reads the spec table at index 1 into `arena`. Raises nothing; the caller frees the arena on
+    /// error.
+    fn readRunSpec(lua: *Lua, arena: Allocator) RunSpecError!RunSpec {
+        lua.checkStack(8) catch return error.OutOfMemory;
+
+        const argv = try readCommand(lua, arena);
+        const stdin = try readOptionalString(lua, arena, "stdin", error.BadStdin);
+        const cwd = try readOptionalString(lua, arena, "cwd", error.BadCwd);
+        const environment = try readEnvironment(lua, arena);
+
+        return .{ .argv = argv, .stdin = stdin, .cwd = cwd, .environment = environment };
+    }
+
+    fn readCommand(lua: *Lua, arena: Allocator) RunSpecError![]const []const u8 {
+        if (lua.getField(1, "cmd") != .table) {
+            return error.BadCommand;
+        }
+
+        var argv: std.ArrayList([]const u8) = .empty;
+        for (1..lua.lenRaw(-1) + 1) |position| {
+            _ = lua.getIndexRaw(-1, @intCast(position));
+            if (lua.typeOf(-1) != .string) {
+                return error.BadCommand;
+            }
+
+            try argv.append(arena, try arena.dupe(u8, lua.toString(-1) catch unreachable));
+            lua.pop(1);
+        }
+        lua.pop(1);
+
+        if (argv.items.len == 0) {
+            return error.BadCommand;
+        }
+
+        return argv.items;
+    }
+
+    /// The string in field `name` of the spec table, or null when absent.
+    fn readOptionalString(lua: *Lua, arena: Allocator, name: [:0]const u8, bad_type: RunSpecError) RunSpecError!?[]const u8 {
+        defer lua.pop(1);
+
+        return switch (lua.getField(1, name)) {
+            .nil => null,
+            .string => try arena.dupe(u8, lua.toString(-1) catch unreachable),
+            else => bad_type,
+        };
+    }
+
+    fn readEnvironment(lua: *Lua, arena: Allocator) RunSpecError![]const [2][]const u8 {
+        defer lua.pop(1);
+
+        var entries: std.ArrayList([2][]const u8) = .empty;
+        switch (lua.getField(1, "env")) {
+            .nil => {},
+            .table => {
+                lua.pushNil();
+                while (lua.next(-2)) {
+                    if (lua.typeOf(-2) != .string or lua.typeOf(-1) != .string) {
+                        return error.BadEnvironment;
+                    }
+
+                    try entries.append(arena, .{
+                        try arena.dupe(u8, lua.toString(-2) catch unreachable),
+                        try arena.dupe(u8, lua.toString(-1) catch unreachable),
+                    });
+                    lua.pop(1);
+                }
+            },
+            else => return error.BadEnvironment,
+        }
+
+        return entries.items;
+    }
+};
