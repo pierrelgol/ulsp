@@ -354,3 +354,132 @@ fn isSequence(lua: *Lua, absolute_index: i32, length: usize) bool {
 }
 
 const testing = std.testing;
+
+const Fixture = struct {
+    lua: *Lua,
+    tags: Tags,
+    arena_state: std.heap.ArenaAllocator,
+
+    fn init() !Fixture {
+        var fixture: Fixture = undefined;
+        fixture.lua = try Lua.init(testing.allocator);
+        fixture.lua.openLibs();
+        fixture.tags = Tags.init(fixture.lua);
+        fixture.arena_state = .init(testing.allocator);
+
+        return fixture;
+    }
+
+    fn deinit(fixture: *Fixture) void {
+        fixture.arena_state.deinit();
+        fixture.tags.deinit(fixture.lua);
+        fixture.lua.deinit();
+    }
+
+    fn evaluate(fixture: *Fixture, source: [:0]const u8) !json.Value {
+        fixture.lua.setTop(0);
+        try fixture.lua.doString(source);
+
+        return toJson(fixture.lua, fixture.tags, fixture.arena_state.allocator(), -1);
+    }
+};
+
+test "JSON to Lua to JSON round trip, every row of 6.4" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    const arena = fixture.arena_state.allocator();
+    const source =
+        \\{"a":null,"b":[],"c":{},"d":[1,2.5,{"e":[{}]}],"f":"s","g":true,"h":3.0,"i":-7,"j":1e2,"k":18446744073709551616}
+    ;
+    const parsed = try json.parseFromSliceLeaky(json.Value, arena, source, .{});
+    try push(fixture.lua, fixture.tags, parsed);
+    const back = try toJson(fixture.lua, fixture.tags, arena, -1);
+
+    const object = back.object;
+    try testing.expect(object.get("a").? == .null);
+    try testing.expectEqual(@as(usize, 0), object.get("b").?.array.items.len);
+    try testing.expect(object.get("c").? == .object);
+
+    const items = object.get("d").?.array.items;
+    try testing.expectEqual(@as(i64, 1), items[0].integer);
+    try testing.expectEqual(@as(f64, 2.5), items[1].float);
+    try testing.expect(items[2].object.get("e").?.array.items[0] == .object);
+    try testing.expectEqualStrings("s", object.get("f").?.string);
+    try testing.expectEqual(true, object.get("g").?.bool);
+    try testing.expectEqual(@as(i64, 3), object.get("h").?.integer); // float with integral value
+    try testing.expectEqual(@as(i64, -7), object.get("i").?.integer);
+    try testing.expectEqual(@as(i64, 100), object.get("j").?.integer);
+
+    // Lua-side types: integer stays integer, 1e2 is a float, the big number is a float.
+    fixture.lua.setGlobal("v");
+    try fixture.lua.doString("assert(math.type(v.i) == 'integer' and math.type(v.h) == 'float' and math.type(v.k) == 'float')");
+    // null is truthy and is not nil
+    try fixture.lua.doString("assert(v.a ~= nil and v.a)");
+}
+
+test "untagged tables" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    const value = try fixture.evaluate("return { seq = {1, 2, 3}, empty = {}, half = 4 / 2, nan = 0/0, inf = 1/0 }");
+
+    const object = value.object;
+    try testing.expectEqual(@as(usize, 3), object.get("seq").?.array.items.len);
+    try testing.expect(object.get("empty").? == .object);
+    try testing.expectEqual(@as(i64, 2), object.get("half").?.integer);
+    try testing.expect(object.get("nan").? == .null);
+    try testing.expect(object.get("inf").? == .null);
+}
+
+test "failure cases" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    try testing.expectError(error.UnsupportedType, fixture.evaluate("return { f = print }"));
+    try testing.expectError(error.UnsupportedType, fixture.evaluate("return { [1.5] = 1 }"));
+    try testing.expectError(error.UnsupportedType, fixture.evaluate("return { a = 1, [2] = 1 }")); // mixed keys
+    try testing.expectError(error.UnsupportedType, fixture.evaluate("return coroutine.create(print)"));
+    try testing.expectError(error.InvalidUtf8, fixture.evaluate("return { s = '\\xff' }"));
+    try testing.expectError(error.DepthExceeded, fixture.evaluate("local t = {}; t.self = t; return t"));
+    try testing.expectEqual(@as(i32, 1), fixture.lua.getTop()); // stack stays balanced after failures
+}
+
+test "tagged empty tables" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    fixture.lua.setTop(0);
+    fixture.lua.createTable(0, 0);
+    fixture.tags.push(fixture.lua, true);
+    fixture.lua.setMetatable(-2);
+    const array = try toJson(fixture.lua, fixture.tags, fixture.arena_state.allocator(), -1);
+    try testing.expect(array == .array);
+
+    fixture.lua.pop(1);
+    fixture.lua.createTable(0, 0);
+    fixture.tags.push(fixture.lua, false);
+    fixture.lua.setMetatable(-2);
+    const object = try toJson(fixture.lua, fixture.tags, fixture.arena_state.allocator(), -1);
+    try testing.expect(object == .object);
+}
+
+test "push depth limit" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    const arena = fixture.arena_state.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    for (0..70) |_| {
+        try text.append(arena, '[');
+    }
+    for (0..70) |_| {
+        try text.append(arena, ']');
+    }
+
+    const value = try json.parseFromSliceLeaky(json.Value, arena, text.items, .{ .max_value_len = null });
+    fixture.lua.setTop(0);
+
+    try testing.expectError(error.DepthExceeded, push(fixture.lua, fixture.tags, value));
+    try testing.expectEqual(@as(i32, 0), fixture.lua.getTop());
+}
