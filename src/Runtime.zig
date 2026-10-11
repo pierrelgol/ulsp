@@ -143,3 +143,75 @@ pub fn noteNativeBytes(runtime: *Runtime, byte_count: usize) void {
     runtime.native_bytes_since_collection = 0;
     runtime.lua.gcCollect();
 }
+
+/// Returns the exit code. Timers due at the start of a pass run before the next
+/// wait, so a busy queue cannot starve them, and they cannot starve the queue.
+pub fn run(runtime: *Runtime) u8 {
+    while (true) {
+        // One clock reading per pass: a sleep armed by a handler waits for the next pass, so a
+        // `sleep(0)` loop cannot keep the queue from being read.
+        const pass_start_ns = runtime.operation_table.now();
+        while (runtime.operation_table.popDueTimer(pass_start_ns)) |operation| {
+            runtime.deliverTimer(operation);
+            if (runtime.exit_code) |code| {
+                return code;
+            }
+        }
+
+        runtime.operation_table.armWake();
+        const event = runtime.queue.getOneUncancelable(runtime.io) catch return runtime.exit_code orelse 1;
+        if (!runtime.handleEvent(event)) {
+            return runtime.exit_code.?;
+        }
+    }
+}
+
+/// Handles one event. Returns false when the loop should stop.
+fn handleEvent(runtime: *Runtime, event: operations.Event) bool {
+    switch (event) {
+        .message => |bytes| {
+            defer runtime.gpa.free(bytes);
+            runtime.hooks.on_message(runtime, bytes);
+        },
+        .completion => |operation| runtime.deliverCompletion(operation),
+        .tick => runtime.operation_table.disarmWake(),
+        .eof => {
+            if (runtime.exit_code == null) {
+                runtime.exit_code = 1;
+            }
+        },
+    }
+
+    return runtime.exit_code == null;
+}
+
+fn deliverCompletion(runtime: *Runtime, operation: *Operation) void {
+    runtime.operation_table.takeCompleted(operation);
+    defer runtime.operation_table.destroyOperation(operation);
+
+    if (operation.detached) {
+        return;
+    }
+    lua_calls.callOnCompletion(runtime, operation);
+}
+
+/// Delivers one finished sleep. It was never in the queue and cannot be detached: cancel
+/// removes a sleep from the table before it can fire.
+fn deliverTimer(runtime: *Runtime, operation: *Operation) void {
+    defer runtime.operation_table.destroyOperation(operation);
+    lua_calls.callOnCompletion(runtime, operation);
+}
+
+fn drainQueue(runtime: *Runtime) void {
+    var slot: [1]operations.Event = undefined;
+    while ((runtime.queue.get(runtime.io, &slot, 0) catch 0) == 1) {
+        switch (slot[0]) {
+            .message => |bytes| runtime.gpa.free(bytes),
+            .completion => |operation| {
+                runtime.operation_table.takeCompleted(operation);
+                runtime.operation_table.destroyOperation(operation);
+            },
+            .tick, .eof => {},
+        }
+    }
+}
