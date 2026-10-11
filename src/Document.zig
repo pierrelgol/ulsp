@@ -147,3 +147,75 @@ pub fn fullRange(document: *const Document, encoding: Encoding) Range {
 }
 
 const testing = std.testing;
+
+fn createTestDocument(text: []const u8) !*Document {
+    return Document.create(testing.allocator, "file:///a", "lua", 1, text);
+}
+
+test "lines and terminators" {
+    const document = try createTestDocument("ab\r\ncd\ref\n\r\nlast\r");
+    defer document.release();
+
+    try testing.expectEqual(@as(usize, 4), document.lineCount());
+
+    const expected_lines = [_][]const u8{ "ab", "cd\ref", "", "last\r" };
+    for (expected_lines, 0..) |expected_line, line_index| {
+        const bounds = document.lineBounds(line_index).?;
+        try testing.expectEqualStrings(expected_line, document.bytes()[bounds.start..bounds.end]);
+    }
+    try testing.expect(document.lineBounds(4) == null);
+
+    const empty_document = try createTestDocument("");
+    defer empty_document.release();
+    try testing.expectEqual(@as(usize, 1), empty_document.lineCount());
+}
+
+test "offset clamps" {
+    const document = try createTestDocument("ab\ncd");
+    defer document.release();
+
+    try testing.expectEqual(@as(usize, 2), document.offsetFromPosition(.@"utf-8", .{ .line = 0, .character = 99 }));
+    try testing.expectEqual(@as(usize, 5), document.offsetFromPosition(.@"utf-8", .{ .line = 9, .character = 0 }));
+    try testing.expectEqual(@as(usize, 4), document.offsetFromPosition(.@"utf-8", .{ .line = 1, .character = 1 }));
+}
+
+test "utf-8 vs utf-16" {
+    // "a", U+00E9 (2 bytes, 1 unit), U+1F600 (4 bytes, 2 units), "z"
+    const document = try createTestDocument("a\u{e9}\u{1F600}z");
+    defer document.release();
+
+    try testing.expectEqual(@as(usize, 3), document.offsetFromPosition(.@"utf-8", .{ .line = 0, .character = 3 }));
+    try testing.expectEqual(@as(usize, 3), document.offsetFromPosition(.@"utf-16", .{ .line = 0, .character = 2 }));
+    try testing.expectEqual(@as(usize, 7), document.offsetFromPosition(.@"utf-16", .{ .line = 0, .character = 4 })); // after the pair
+    try testing.expectEqual(Position{ .line = 0, .character = 4 }, document.positionFromOffset(.@"utf-16", 7));
+    try testing.expectEqual(Position{ .line = 0, .character = 7 }, document.positionFromOffset(.@"utf-8", 7));
+
+    const range = document.fullRange(.@"utf-16");
+    try testing.expectEqual(Position{ .line = 0, .character = 5 }, range.end);
+}
+
+test "replace reports the edit" {
+    const document = try createTestDocument("ab\ncd");
+    defer document.release();
+
+    const edit = try document.replace(1, 4, "X\nYZ");
+
+    try testing.expectEqualStrings("aX\nYZd", document.bytes());
+    try testing.expectEqual(Point{ .row = 0, .column = 1 }, edit.start);
+    try testing.expectEqual(Point{ .row = 1, .column = 1 }, edit.old_end);
+    try testing.expectEqual(Point{ .row = 1, .column = 2 }, edit.new_end);
+    try testing.expectEqual(@as(usize, 5), edit.new_end_byte);
+}
+
+test "snapshot keeps the old text" {
+    const document = try createTestDocument("abc");
+    defer document.release();
+
+    const snapshot_copy = try document.snapshot();
+    defer snapshot_copy.release();
+    _ = try document.replace(0, 3, "xyz!");
+
+    try testing.expectEqualStrings("abc", snapshot_copy.bytes());
+    try testing.expectEqualStrings("xyz!", document.bytes());
+    try testing.expect(snapshot_copy.is_snapshot and !document.is_snapshot);
+}
