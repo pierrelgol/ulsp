@@ -106,3 +106,48 @@ pub const positions = struct {
         lua.setField(-2, "end");
     }
 };
+
+/// Nesting limit for JSON text: bounds the stack and memory a hostile `[[[[...` input can make
+/// the parser use.
+pub const max_json_depth = 128;
+
+pub fn isNestingWithinLimit(bytes: []const u8) bool {
+    var depth: usize = 0;
+    var in_string = false;
+    var index: usize = 0;
+
+    while (index < bytes.len) : (index += 1) {
+        const byte = bytes[index];
+
+        if (in_string) {
+            if (byte == '\\') {
+                index += 1;
+            } else if (byte == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        switch (byte) {
+            '"' => in_string = true,
+            '[', '{' => {
+                depth += 1;
+                if (depth > max_json_depth) {
+                    return false;
+                }
+            },
+            ']', '}' => depth -|= 1,
+            else => {},
+        }
+    }
+
+    return true;
+}
+
+test "nesting prescan" {
+    try std.testing.expect(isNestingWithinLimit("{\"a\":[1,2,{\"b\":\"[[[[\\\"[\"}]}"));
+
+    var deep: [200]u8 = undefined;
+    @memset(&deep, '[');
+    try std.testing.expect(!isNestingWithinLimit(&deep));
+}
