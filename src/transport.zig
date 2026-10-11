@@ -142,3 +142,64 @@ test "output over the cap is dropped and counted" {
 
     writer.discardQueued(std.testing.io);
 }
+
+/// The client channel, moved off fd 0 and fd 1 by `isolateProtocolStreams`.
+pub const ProtocolStreams = struct {
+    input: std.Io.File,
+    output: std.Io.File,
+
+    /// Both handles are plain blocking files: the transport owns the reading and writing policy.
+    pub fn fromHandles(input_handle: std.Io.File.Handle, output_handle: std.Io.File.Handle) ProtocolStreams {
+        return .{
+            .input = .{ .handle = input_handle, .flags = .{ .nonblocking = false } },
+            .output = .{ .handle = output_handle, .flags = .{ .nonblocking = false } },
+        };
+    }
+};
+
+pub const IsolateError = error{IsolateFailed};
+
+/// A pipe accepts a write up to PIPE_BUF whole when poll says it is writable.
+const max_stderr_line_bytes = 4096;
+const first_private_descriptor: c_int = 3;
+
+/// Moves the protocol channel onto private close-on-exec descriptors, then points
+/// fd 0 at /dev/null and fd 1 at stderr so nothing else can corrupt the protocol stream.
+pub fn isolateProtocolStreams() IsolateError!ProtocolStreams {
+    const input_fd = c.fcntl(0, c.F.DUPFD_CLOEXEC, first_private_descriptor);
+    if (input_fd < 0) {
+        return error.IsolateFailed;
+    }
+
+    const output_fd = c.fcntl(1, c.F.DUPFD_CLOEXEC, first_private_descriptor);
+    if (output_fd < 0) {
+        return error.IsolateFailed;
+    }
+
+    const null_fd = c.open("/dev/null", .{ .ACCMODE = .RDWR });
+    if (null_fd < 0) {
+        return error.IsolateFailed;
+    }
+    defer _ = c.close(null_fd);
+
+    if (c.dup2(null_fd, 0) < 0) {
+        return error.IsolateFailed;
+    }
+    if (c.dup2(2, 1) < 0) {
+        return error.IsolateFailed;
+    }
+
+    return .fromHandles(input_fd, output_fd);
+}
+
+/// Writes one line to stderr without ever blocking: dropped when nobody reads it. A line longer
+/// than `max_stderr_line_bytes` is cut to that.
+pub fn writeStderrNonBlocking(line: []const u8) void {
+    var poll_descriptor: c.pollfd = .{ .fd = 2, .events = c.POLL.OUT, .revents = 0 };
+    const ready_count = c.poll(@ptrCast(&poll_descriptor), 1, 0);
+    if (ready_count <= 0 or poll_descriptor.revents & c.POLL.OUT == 0) {
+        return;
+    }
+
+    _ = c.write(2, line.ptr, @min(line.len, max_stderr_line_bytes));
+}
