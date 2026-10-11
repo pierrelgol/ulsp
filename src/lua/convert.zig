@@ -224,3 +224,133 @@ fn pushAtDepth(lua: *Lua, tags: Tags, value: json.Value, depth: u32) Error!void 
         },
     }
 }
+
+fn toJsonAtDepth(lua: *Lua, tags: Tags, arena: Allocator, index: i32, depth: u32) Error!json.Value {
+    if (depth > max_depth) {
+        return error.DepthExceeded;
+    }
+
+    const absolute_index = lua.absIndex(index);
+    switch (lua.typeOf(absolute_index)) {
+        .none, .nil => return .null,
+        .boolean => return .{ .bool = lua.toBoolean(absolute_index) },
+        .number => return numberToJson(lua, absolute_index),
+        .string => {
+            const text = lua.toString(absolute_index) catch unreachable;
+            if (!std.unicode.utf8ValidateSlice(text)) {
+                return error.InvalidUtf8;
+            }
+
+            return .{ .string = try arena.dupe(u8, text) };
+        },
+        .light_userdata => {
+            if (isNull(lua, absolute_index)) {
+                return .null;
+            }
+
+            return error.UnsupportedType;
+        },
+        .table => return tableToJson(lua, tags, arena, absolute_index, depth),
+        else => return error.UnsupportedType,
+    }
+}
+
+/// Integers stay integers; a float with an integral value becomes one; NaN and infinity are null.
+fn numberToJson(lua: *Lua, absolute_index: i32) json.Value {
+    if (lua.isInteger(absolute_index)) {
+        return .{ .integer = lua.toInteger(absolute_index) catch unreachable };
+    }
+
+    const number = lua.toNumber(absolute_index) catch unreachable;
+    if (!std.math.isFinite(number)) {
+        return .null;
+    }
+    if (@floor(number) == number and @abs(number) < 9.0e18) {
+        return .{ .integer = @intFromFloat(number) };
+    }
+
+    return .{ .float = number };
+}
+
+fn tableToJson(lua: *Lua, tags: Tags, arena: Allocator, absolute_index: i32, depth: u32) Error!json.Value {
+    lua.checkStack(6) catch return error.OutOfMemory;
+
+    const length = lua.lenRaw(absolute_index);
+    var shape = tags.shapeOf(lua, absolute_index);
+    if (shape == .none) {
+        const is_sequence = length > 0 and isSequence(lua, absolute_index, length);
+        shape = if (is_sequence) .array else .object;
+    }
+
+    if (shape == .array) {
+        return arrayToJson(lua, tags, arena, absolute_index, length, depth);
+    }
+
+    return objectToJson(lua, tags, arena, absolute_index, depth);
+}
+
+fn arrayToJson(lua: *Lua, tags: Tags, arena: Allocator, absolute_index: i32, length: usize, depth: u32) Error!json.Value {
+    var array: json.Array = .init(arena);
+
+    var position: usize = 1;
+    while (position <= length) : (position += 1) {
+        _ = lua.getIndexRaw(absolute_index, @intCast(position));
+        defer lua.pop(1);
+
+        try array.append(try toJsonAtDepth(lua, tags, arena, -1, depth + 1));
+    }
+
+    return .{ .array = array };
+}
+
+fn objectToJson(lua: *Lua, tags: Tags, arena: Allocator, absolute_index: i32, depth: u32) Error!json.Value {
+    var object: json.ObjectMap = .empty;
+
+    lua.pushNil();
+    while (lua.next(absolute_index)) {
+        // On an error the iteration is abandoned with key and value still on the stack.
+        errdefer lua.pop(2);
+
+        // Key at -2, value at -1. Never call toString on a non-string key: it would convert it
+        // in place.
+        if (lua.typeOf(-2) != .string) {
+            return error.UnsupportedType;
+        }
+
+        const key = try arena.dupe(u8, lua.toString(-2) catch unreachable);
+        const value = try toJsonAtDepth(lua, tags, arena, -1, depth + 1);
+        if (!std.unicode.utf8ValidateSlice(key)) {
+            return error.InvalidUtf8;
+        }
+
+        try object.put(arena, key, value);
+        lua.pop(1);
+    }
+
+    return .{ .object = object };
+}
+
+/// True when the table holds exactly the keys 1..length.
+fn isSequence(lua: *Lua, absolute_index: i32, length: usize) bool {
+    var key_count: usize = 0;
+
+    lua.pushNil();
+    while (lua.next(absolute_index)) {
+        key_count += 1;
+
+        const is_position = lua.isInteger(-2) and blk: {
+            const key = lua.toInteger(-2) catch unreachable;
+            break :blk key >= 1 and key <= length;
+        };
+        if (!is_position) {
+            lua.pop(2);
+            return false;
+        }
+
+        lua.pop(1);
+    }
+
+    return key_count == length;
+}
+
+const testing = std.testing;
