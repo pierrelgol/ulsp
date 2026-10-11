@@ -202,3 +202,211 @@ pub const QueryBudget = struct {
         return true;
     }
 };
+
+/// The methods of tree-sitter node handles The generated functions take the
+/// tree-sitter method name, which must stay as the library spells it.
+pub const node_calls = struct {
+    pub const methods = .{
+        .{ "type", nodeType },
+        .{ "is_named", flagMethod("isNamed") },
+        .{ "is_missing", flagMethod("isMissing") },
+        .{ "is_error", flagMethod("isError") },
+        .{ "has_error", flagMethod("hasError") },
+        .{ "text", nodeText },
+        .{ "range", nodeRange },
+        .{ "byte_range", nodeByteRange },
+        .{ "start_point", pointMethod("startPoint") },
+        .{ "end_point", pointMethod("endPoint") },
+        .{ "child_count", countMethod("childCount") },
+        .{ "named_child_count", countMethod("namedChildCount") },
+        .{ "child", childAtMethod("child") },
+        .{ "named_child", childAtMethod("namedChild") },
+        .{ "children", childrenMethod("child", "childCount") },
+        .{ "named_children", childrenMethod("namedChild", "namedChildCount") },
+        .{ "field", nodeField },
+        .{ "parent", relativeMethod("parent") },
+        .{ "next_sibling", relativeMethod("nextSibling") },
+        .{ "prev_sibling", relativeMethod("prevSibling") },
+        .{ "next_named_sibling", relativeMethod("nextNamedSibling") },
+        .{ "prev_named_sibling", relativeMethod("prevNamedSibling") },
+        .{ "descendant_for_range", descendantMethod("descendantForByteRange") },
+        .{ "named_descendant_for_range", descendantMethod("namedDescendantForByteRange") },
+        .{ "sexp", nodeSexp },
+    };
+
+    /// Character offset of `byte` on its line, in `encoding`; `column` is the byte column from
+    /// tree-sitter.
+    pub fn characterOnLine(text: []const u8, encoding: Document.Encoding, byte: u32, column: u32) u32 {
+        const line_start = byte - @min(column, byte);
+
+        return @intCast(offsets.countCodeUnits(text[line_start..byte], encoding));
+    }
+
+    fn unsignedArgument(lua: *Lua, index: i32) u32 {
+        return @intCast(std.math.clamp(lua.checkInteger(index), 0, std.math.maxInt(u32)));
+    }
+
+    fn nodeType(lua: *Lua) i32 {
+        _ = lua.pushString(NodeBox.argument(lua, 1).node.kind());
+
+        return 1;
+    }
+
+    fn flagMethod(comptime method: []const u8) fn (*Lua) i32 {
+        return struct {
+            fn call(lua: *Lua) i32 {
+                lua.pushBoolean(@field(ts.Node, method)(NodeBox.argument(lua, 1).node));
+
+                return 1;
+            }
+        }.call;
+    }
+
+    fn nodeText(lua: *Lua) i32 {
+        _ = lua.pushString(NodeBox.argument(lua, 1).bytes());
+
+        return 1;
+    }
+
+    fn nodeRange(lua: *Lua) i32 {
+        const runtime = Runtime.of(lua);
+        const box = NodeBox.argument(lua, 1);
+        const encoding = runtime.documents.effectiveEncoding();
+        const text = box.shared_tree.text;
+        const bounds = box.byteBounds();
+        const start_point = box.node.startPoint();
+        const end_point = box.node.endPoint();
+
+        positions.pushRange(lua, .{
+            .start = .{
+                .line = start_point.row,
+                .character = characterOnLine(text, encoding, @intCast(bounds.start), start_point.column),
+            },
+            .end = .{
+                .line = end_point.row,
+                .character = characterOnLine(text, encoding, @intCast(bounds.end), end_point.column),
+            },
+        });
+
+        return 1;
+    }
+
+    fn nodeByteRange(lua: *Lua) i32 {
+        const box = NodeBox.argument(lua, 1);
+        lua.pushInteger(box.node.startByte());
+        lua.pushInteger(box.node.endByte());
+
+        return 2;
+    }
+
+    fn pointMethod(comptime method: []const u8) fn (*Lua) i32 {
+        return struct {
+            fn call(lua: *Lua) i32 {
+                const point = @field(ts.Node, method)(NodeBox.argument(lua, 1).node);
+
+                lua.createTable(0, 2);
+                lua.pushInteger(point.row);
+                lua.setField(-2, "row");
+                lua.pushInteger(point.column);
+                lua.setField(-2, "column");
+
+                return 1;
+            }
+        }.call;
+    }
+
+    fn countMethod(comptime method: []const u8) fn (*Lua) i32 {
+        return struct {
+            fn call(lua: *Lua) i32 {
+                lua.pushInteger(@field(ts.Node, method)(NodeBox.argument(lua, 1).node));
+
+                return 1;
+            }
+        }.call;
+    }
+
+    /// `node:child(i)` counts from 1.
+    fn childAtMethod(comptime method: []const u8) fn (*Lua) i32 {
+        return struct {
+            fn call(lua: *Lua) i32 {
+                const box = NodeBox.argument(lua, 1);
+                const position = lua.checkInteger(2);
+
+                var child: ?ts.Node = null;
+                if (position >= 1 and position <= std.math.maxInt(u32)) {
+                    child = @field(ts.Node, method)(box.node, @intCast(position - 1));
+                }
+                NodeBox.pushOptional(lua, box.shared_tree, child);
+
+                return 1;
+            }
+        }.call;
+    }
+
+    fn childrenMethod(comptime method: []const u8, comptime count_method: []const u8) fn (*Lua) i32 {
+        return struct {
+            fn call(lua: *Lua) i32 {
+                const box = NodeBox.argument(lua, 1);
+                const child_count = @field(ts.Node, count_method)(box.node);
+
+                lua.createTable(@intCast(child_count), 0);
+
+                // shortcut: child(i) is O(i); use a tree cursor if very wide nodes show up.
+                var child_index: u32 = 0;
+                while (child_index < child_count) : (child_index += 1) {
+                    const child = @field(ts.Node, method)(box.node, child_index) orelse break;
+                    NodeBox.push(lua, box.shared_tree, child);
+                    lua.setIndex(-2, @intCast(child_index + 1));
+                }
+
+                return 1;
+            }
+        }.call;
+    }
+
+    fn nodeField(lua: *Lua) i32 {
+        const box = NodeBox.argument(lua, 1);
+        const name = lua.checkString(2);
+
+        NodeBox.pushOptional(lua, box.shared_tree, box.node.childByFieldName(name));
+
+        return 1;
+    }
+
+    fn relativeMethod(comptime method: []const u8) fn (*Lua) i32 {
+        return struct {
+            fn call(lua: *Lua) i32 {
+                const box = NodeBox.argument(lua, 1);
+                NodeBox.pushOptional(lua, box.shared_tree, @field(ts.Node, method)(box.node));
+
+                return 1;
+            }
+        }.call;
+    }
+
+    fn descendantMethod(comptime method: []const u8) fn (*Lua) i32 {
+        return struct {
+            fn call(lua: *Lua) i32 {
+                const box = NodeBox.argument(lua, 1);
+                const start_byte = unsignedArgument(lua, 2);
+                const end_byte = unsignedArgument(lua, 3);
+
+                NodeBox.pushOptional(lua, box.shared_tree, @field(ts.Node, method)(box.node, start_byte, end_byte));
+
+                return 1;
+            }
+        }.call;
+    }
+
+    fn nodeSexp(lua: *Lua) i32 {
+        const runtime = Runtime.of(lua);
+        const box = NodeBox.argument(lua, 1);
+
+        const sexp = box.node.toSexp(runtime.gpa) catch raise.text(lua, "out of memory");
+        defer runtime.gpa.free(sexp);
+
+        _ = lua.pushString(sexp);
+
+        return 1;
+    }
+};
