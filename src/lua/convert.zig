@@ -151,3 +151,76 @@ test "nesting prescan" {
     @memset(&deep, '[');
     try std.testing.expect(!isNestingWithinLimit(&deep));
 }
+
+pub const max_depth = 64;
+
+pub const Error = error{ UnsupportedType, DepthExceeded, InvalidUtf8, OutOfMemory };
+
+/// The address of this byte is `ulsp.null`.
+const null_sentinel: u8 = 0;
+
+pub fn pushNull(lua: *Lua) void {
+    lua.pushLightUserdata(&null_sentinel);
+}
+
+/// Pushes `value`. Fails, leaving the stack as it was, if nesting exceeds `max_depth`.
+pub fn push(lua: *Lua, tags: Tags, value: json.Value) Error!void {
+    return pushAtDepth(lua, tags, value, 0);
+}
+
+/// Reads the Lua value at `index`. Allocates only from `arena`. Does not raise Lua errors.
+pub fn toJson(lua: *Lua, tags: Tags, arena: Allocator, index: i32) Error!json.Value {
+    return toJsonAtDepth(lua, tags, arena, index, 0);
+}
+
+pub fn errorText(err: Error) [:0]const u8 {
+    return switch (err) {
+        error.UnsupportedType => "cannot convert value to JSON: unsupported type or non-string key",
+        error.DepthExceeded => "cannot convert value to JSON: nesting too deep",
+        error.InvalidUtf8 => "cannot convert value to JSON: string is not valid UTF-8",
+        error.OutOfMemory => "out of memory",
+    };
+}
+
+fn isNull(lua: *Lua, index: i32) bool {
+    return lua.typeOf(index) == .light_userdata and lua.toPointer(index) == @as(*const anyopaque, &null_sentinel);
+}
+
+fn pushAtDepth(lua: *Lua, tags: Tags, value: json.Value, depth: u32) Error!void {
+    if (depth > max_depth) {
+        return error.DepthExceeded;
+    }
+    lua.checkStack(6) catch return error.OutOfMemory;
+
+    const top = lua.getTop();
+    errdefer lua.setTop(top);
+
+    switch (value) {
+        .null => pushNull(lua),
+        .bool => |boolean| lua.pushBoolean(boolean),
+        .integer => |integer| lua.pushInteger(integer),
+        .float => |float| lua.pushNumber(float),
+        .number_string => |digits| lua.pushNumber(std.fmt.parseFloat(f64, digits) catch 0),
+        .string => |text| _ = lua.pushString(text),
+        .array => |array| {
+            lua.createTable(@intCast(array.items.len), 0);
+            for (array.items, 1..) |item, position| {
+                try pushAtDepth(lua, tags, item, depth + 1);
+                lua.setIndex(-2, @intCast(position));
+            }
+            tags.push(lua, true);
+            lua.setMetatable(-2);
+        },
+        .object => |object| {
+            lua.createTable(0, @intCast(object.count()));
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                _ = lua.pushString(entry.key_ptr.*);
+                try pushAtDepth(lua, tags, entry.value_ptr.*, depth + 1);
+                lua.setTable(-3);
+            }
+            tags.push(lua, false);
+            lua.setMetatable(-2);
+        },
+    }
+}
