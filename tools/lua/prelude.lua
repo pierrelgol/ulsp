@@ -237,3 +237,161 @@ local function run_config()
   local o = S.outcome(f)
   if o.kind == "error" then log.error("configuration failed: " .. o.trace) end
 end
+
+-- JSON numbers like 1.0 are the same id as 1: fold integral floats so table lookups agree.
+local function norm_id(id)
+  if math.type(id) == "float" then return math.tointeger(id) or id end
+  return id
+end
+
+local function finish_request(id, f)
+  if inflight[id] == f then inflight[id] = nil end
+  S.observe(f)
+  local o = S.outcome(f)
+  if o.kind == "ok" then
+    respond(id, o.values[1])
+  elseif o.kind == "canceled" then
+    reply_error(id, -32800, "Request cancelled")
+  else
+    local err = o.err
+    if type(err) == "table" and math.type(err.code) == "integer" and type(err.message) == "string" then
+      reply_error(id, err.code, err.message, err.data)
+    else
+      log.error("request " .. tostring(id) .. " failed: " .. o.trace)
+      reply_error(id, -32603, tostring(err))
+    end
+  end
+end
+
+local function dispatch_request(msg)
+  local id = msg.id
+  if inflight[id] ~= nil then return reply_error(id, -32600, "Invalid request") end
+  local list = handlers[msg.method]
+  local handler = list and list[1]
+  if not handler then return reply_error(id, -32601, "Method not found") end
+  local f = S.async(handler, msg.params)
+  inflight[id] = f
+  S.on_done(f, function(done) finish_request(id, done) end)
+end
+
+local function do_initialize(msg)
+  state = "initializing"
+  local params = msg.params
+  ulsp.initialize_params = params
+  encoding = "utf-16"
+  local general = type(params) == "table" and type(params.capabilities) == "table"
+    and params.capabilities.general
+  local list = type(general) == "table" and general.positionEncodings
+  if type(list) == "table" then
+    for _, name in ipairs(list) do
+      if name == "utf-8" then encoding = "utf-8" break end
+    end
+  end
+  core.set_encoding(encoding)
+  local function folder_path(uri)
+    local ok, path = pcall(core.uri_to_path, uri)
+    return ok and path or nil
+  end
+  ulsp.workspace_folders = {}
+  if type(params) == "table" then
+    if type(params.workspaceFolders) == "table" then
+      for _, f in ipairs(params.workspaceFolders) do
+        local path = type(f) == "table" and type(f.uri) == "string" and folder_path(f.uri)
+        if path then ulsp.workspace_folders[#ulsp.workspace_folders + 1] = path end
+      end
+    end
+    if type(params.rootUri) == "string" then ulsp.root = folder_path(params.rootUri) end
+  end
+  ulsp.root = ulsp.root or ulsp.workspace_folders[1]
+  S.async(function()
+    run_config()
+    local ok, caps = pcall(build_capabilities)
+    if ok then
+      respond(msg.id, { capabilities = caps, serverInfo = { name = "ulsp", version = ulsp.version } })
+    else
+      log.error("cannot build capabilities: " .. tostring(caps))
+      reply_error(msg.id, -32603, tostring(caps))
+    end
+    state = "running"
+  end)
+end
+
+local function handle_request(msg)
+  local id, method = msg.id, msg.method
+  if state == "uninitialized" then
+    if method == "initialize" then return do_initialize(msg) end
+    return reply_error(id, -32002, "Server not initialized")
+  elseif state == "initializing" then
+    return reply_error(id, -32002, "Server not initialized")
+  elseif state == "running" then
+    if method == "initialize" then return reply_error(id, -32600, "Invalid request") end
+    if method == "shutdown" then
+      for _, f in pairs(inflight) do f:cancel() end
+      state = "shutdown"
+      return respond(id, null)
+    end
+    return dispatch_request(msg)
+  end
+  return reply_error(id, -32600, "Invalid request")
+end
+
+local function handle_notification(msg)
+  local method = msg.method
+  if method == "exit" then return core.exit(state == "shutdown" and 0 or 1) end
+  if state ~= "running" then return end
+  if method == "$/cancelRequest" then
+    local p = msg.params
+    local f = type(p) == "table" and p.id ~= nil and inflight[norm_id(p.id)]
+    if f then f:cancel() end
+    return
+  end
+  local list = handlers[method]
+  if not list then return end
+  for i = 1, #list do
+    local f = S.async(list[i], msg.params)
+    S.on_done(f, function(done)
+      S.observe(done)
+      local o = S.outcome(done)
+      if o.kind == "error" then log.error("notification " .. method .. " failed: " .. o.trace) end
+    end)
+  end
+end
+
+local function handle_response(msg)
+  local task = pending[msg.id]
+  if not task then return end
+  pending[msg.id] = nil
+  S.wake(task, true, msg)
+end
+
+local function valid_id(id)
+  local t = type(id)
+  return t == "number" or t == "string" or id == null
+end
+
+local function handle(msg)
+  if type(msg) == "table" then
+    if msg.id ~= nil then msg.id = norm_id(msg.id) end
+    local method, id = msg.method, msg.id
+    if type(method) == "string" and id == nil then return handle_notification(msg) end
+    if type(method) == "string" and valid_id(id) then return handle_request(msg) end
+    if method == nil and id ~= nil and valid_id(id) then return handle_response(msg) end
+    return reply_error(valid_id(id) and id or nil, -32600, "Invalid request")
+  end
+  reply_error(nil, -32600, "Invalid request")
+end
+
+local function on_message(msg)
+  local ok, err = pcall(handle, msg)
+  S.run()
+  if not ok then error(err, 0) end
+end
+
+local function on_completion(id, ok, value)
+  S.on_completion(id, ok, value)
+  S.run()
+end
+
+_G.ulsp = ulsp
+package.loaded.ulsp = ulsp
+return on_message, on_completion
