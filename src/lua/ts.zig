@@ -410,3 +410,148 @@ pub const node_calls = struct {
         return 1;
     }
 };
+
+/// `core.ts_query` and the methods of query handles.
+pub const query_calls = struct {
+    pub const methods = .{
+        .{ "captures", captures },
+        .{ "matches", matches },
+        .{ "capture_names", captureNames },
+    };
+
+    pub fn create(lua: *Lua) i32 {
+        const runtime = Runtime.of(lua);
+        const language = LanguageBox.argument(lua, runtime, 1);
+        const source = lua.checkString(2);
+
+        var error_offset: u32 = 0;
+        const query = ts.Query.create(language.tree_sitter_language, source, &error_offset) catch |err| {
+            raise.formatted(lua, "query error at byte {d}: {s}", .{ error_offset, errorKind(err) });
+        };
+        QueryBox.push(lua, query, language);
+
+        return 1;
+    }
+
+    fn errorKind(err: ts.Query.Error) []const u8 {
+        return switch (err) {
+            error.InvalidSyntax => "syntax",
+            error.InvalidNodeType => "node_type",
+            error.InvalidField => "field",
+            error.InvalidCapture => "capture",
+            error.InvalidStructure => "structure",
+            error.InvalidLanguage => "language",
+        };
+    }
+
+    const Arguments = struct { query_box: *QueryBox, node_box: *NodeBox };
+
+    fn readArguments(lua: *Lua) Arguments {
+        const query_box = QueryBox.argument(lua, 1);
+        const node_box = NodeBox.argument(lua, 2);
+        if (node_box.shared_tree.language != query_box.language) {
+            raise.text(lua, "ulsp: query and node use different languages");
+        }
+
+        return .{ .query_box = query_box, .node_box = node_box };
+    }
+
+    /// A Lua error longjmps over `defer`, so the cursor is destroyed before the raise.
+    fn raiseTimedOut(lua: *Lua, cursor: *ts.QueryCursor) noreturn {
+        cursor.destroy();
+        raise.text(lua, "ulsp: query timed out");
+    }
+
+    fn captures(lua: *Lua) i32 {
+        const runtime = Runtime.of(lua);
+        const arguments = readArguments(lua);
+        const query_box = arguments.query_box;
+        const node_box = arguments.node_box;
+
+        const cursor = ts.QueryCursor.create();
+        defer cursor.destroy();
+        var budget: QueryBudget = .init(runtime.io);
+        budget.execute(cursor, query_box.query, node_box.node);
+
+        lua.createTable(0, 0);
+        var result_count: i64 = 0;
+        while (cursor.nextCapture()) |next| {
+            const capture_index, const match = next;
+            const capture = match.captures[capture_index];
+            result_count += 1;
+
+            lua.createTable(2, 0);
+            _ = lua.pushString(query_box.captureName(capture.index));
+            lua.setIndex(-2, 1);
+            NodeBox.push(lua, node_box.shared_tree, capture.node);
+            lua.setIndex(-2, 2);
+            lua.setIndex(-2, @intCast(result_count));
+        }
+
+        if (budget.hit) {
+            raiseTimedOut(lua, cursor);
+        }
+
+        return 1;
+    }
+
+    fn matches(lua: *Lua) i32 {
+        const runtime = Runtime.of(lua);
+        const arguments = readArguments(lua);
+        const query_box = arguments.query_box;
+        const node_box = arguments.node_box;
+
+        const cursor = ts.QueryCursor.create();
+        defer cursor.destroy();
+        var budget: QueryBudget = .init(runtime.io);
+        budget.execute(cursor, query_box.query, node_box.node);
+
+        lua.createTable(0, 0);
+        var result_count: i64 = 0;
+        while (cursor.nextMatch()) |match| {
+            result_count += 1;
+
+            lua.createTable(0, @intCast(match.captures.len));
+            for (match.captures) |capture| {
+                pushCaptureIfNew(lua, query_box, node_box, capture);
+            }
+            lua.setIndex(-2, @intCast(result_count));
+        }
+
+        if (budget.hit) {
+            raiseTimedOut(lua, cursor);
+        }
+
+        return 1;
+    }
+
+    /// Adds `capture` to the match table on top of the stack; the first capture of a name wins.
+    fn pushCaptureIfNew(lua: *Lua, query_box: *const QueryBox, node_box: *const NodeBox, capture: ts.Query.Capture) void {
+        const name = query_box.captureName(capture.index);
+
+        _ = lua.pushString(name);
+        const already_present = lua.getTable(-2) != .nil;
+        lua.pop(1);
+        if (already_present) {
+            return;
+        }
+
+        _ = lua.pushString(name);
+        NodeBox.push(lua, node_box.shared_tree, capture.node);
+        lua.setTable(-3);
+    }
+
+    fn captureNames(lua: *Lua) i32 {
+        const query_box = QueryBox.argument(lua, 1);
+        const capture_count = query_box.query.captureCount();
+
+        lua.createTable(@intCast(capture_count), 0);
+        var capture_id: u32 = 0;
+        while (capture_id < capture_count) : (capture_id += 1) {
+            _ = lua.pushString(query_box.captureName(capture_id));
+            lua.setIndex(-2, @intCast(capture_id + 1));
+        }
+
+        return 1;
+    }
+};
