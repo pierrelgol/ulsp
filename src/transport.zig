@@ -101,3 +101,44 @@ pub const ClientWriter = struct {
         } else |_| {}
     }
 };
+
+/// Sends every message, then `eof` once, unless it was canceled.
+pub fn readLoop(io: std.Io, gpa: std.mem.Allocator, transport: *lsp.Transport, queue: *operations.EventQueue) void {
+    while (true) {
+        const bytes = transport.readJsonMessage(io, gpa) catch |err| {
+            if (err == error.Canceled) {
+                return;
+            }
+            if (err != error.EndOfStream) {
+                var buffer: [128]u8 = undefined;
+                const line = std.fmt.bufPrint(&buffer, "ulsp [error] cannot read a message: {s}\n", .{@errorName(err)}) catch "";
+                writeStderrNonBlocking(line);
+            }
+            break;
+        };
+
+        queue.putOne(io, .{ .message = bytes }) catch {
+            gpa.free(bytes);
+            return;
+        };
+    }
+
+    queue.putOne(io, .eof) catch {};
+}
+
+test "output over the cap is dropped and counted" {
+    var writer: ClientWriter = .{
+        .gpa = std.testing.allocator,
+        .transport = undefined,
+        .pending_bytes = .init(ClientWriter.max_pending_bytes - 3),
+    };
+    writer.queue = .init(&writer.queue_storage);
+
+    writer.push(std.testing.io, "abc");
+    try std.testing.expectEqual(@as(usize, 0), writer.dropped_count);
+
+    writer.push(std.testing.io, "d");
+    try std.testing.expectEqual(@as(usize, 1), writer.dropped_count);
+
+    writer.discardQueued(std.testing.io);
+}
