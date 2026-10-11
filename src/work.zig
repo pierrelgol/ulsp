@@ -251,3 +251,165 @@ fn waitAndKillGroup(child: *std.process.Child, io: Io, group: std.process.Child.
 
     return term;
 }
+
+test "operations over the worker cap wait and all complete" {
+    var harness: TestHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+
+    const total_count = ops.max_workers + 8;
+    for (0..total_count) |_| {
+        _ = try harness.startRun(&.{ "sh", "-c", "sleep 0.2" });
+    }
+    for (0..total_count) |_| {
+        const operation = try harness.nextCompletion();
+        defer harness.table.destroyOperation(operation);
+
+        try testing.expect(operation.result == .process);
+    }
+
+    var tokens: [ops.max_workers]u8 = undefined;
+    const returned_count = try harness.table.slots.get(testing.io, &tokens, ops.max_workers);
+    try testing.expectEqual(@as(usize, ops.max_workers), returned_count);
+}
+
+test "write, read, stat and list" {
+    var harness: TestHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(directory_path);
+    const file_path = try std.fs.path.join(testing.allocator, &.{ directory_path, "f.txt" });
+    defer testing.allocator.free(file_path);
+
+    _ = try harness.start(.{ .write = .{ .path = file_path, .data = "hi" } });
+    {
+        const operation = try harness.nextCompletion();
+        defer harness.table.destroyOperation(operation);
+
+        try testing.expect(operation.result == .completed);
+    }
+
+    _ = try harness.start(.{ .read = file_path });
+    {
+        const operation = try harness.nextCompletion();
+        defer harness.table.destroyOperation(operation);
+
+        try testing.expectEqualStrings("hi", operation.result.bytes);
+    }
+
+    _ = try harness.start(.{ .stat = file_path });
+    {
+        const operation = try harness.nextCompletion();
+        defer harness.table.destroyOperation(operation);
+
+        try testing.expectEqual(@as(u64, 2), operation.result.stat.?.size);
+        try testing.expectEqualStrings("file", operation.result.stat.?.kind);
+    }
+
+    _ = try harness.start(.{ .stat = "/ulsp/none" });
+    {
+        const operation = try harness.nextCompletion();
+        defer harness.table.destroyOperation(operation);
+
+        try testing.expect(operation.result.stat == null);
+    }
+
+    _ = try harness.start(.{ .list = directory_path });
+    {
+        const operation = try harness.nextCompletion();
+        defer harness.table.destroyOperation(operation);
+
+        try testing.expectEqual(@as(usize, 1), operation.result.list.len);
+        try testing.expectEqualStrings("f.txt", operation.result.list[0].name);
+    }
+}
+
+test "write through a symlink keeps the link" {
+    var harness: TestHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "real.txt", .data = "old" });
+    try tmp.dir.symLink(testing.io, "real.txt", "link.txt", .{});
+
+    const directory_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(directory_path);
+    const link_path = try std.fs.path.join(testing.allocator, &.{ directory_path, "link.txt" });
+    defer testing.allocator.free(link_path);
+
+    _ = try harness.start(.{ .write = .{ .path = link_path, .data = "new" } });
+    const operation = try harness.nextCompletion();
+    defer harness.table.destroyOperation(operation);
+    try testing.expect(operation.result == .completed);
+
+    var link_buffer: [16]u8 = undefined;
+    const link_length = try tmp.dir.readLink(testing.io, "link.txt", &link_buffer);
+    try testing.expectEqualStrings("real.txt", link_buffer[0..link_length]);
+
+    const real_contents = try tmp.dir.readFileAlloc(testing.io, "real.txt", testing.allocator, .limited(100));
+    defer testing.allocator.free(real_contents);
+    try testing.expectEqualStrings("new", real_contents);
+}
+
+test "process echoes 300 KiB of stdin" {
+    var harness: TestHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+
+    const input = try testing.allocator.alloc(u8, 300 * 1024);
+    defer testing.allocator.free(input);
+    for (input, 0..) |*byte, index| {
+        byte.* = @intCast('a' + index % 26);
+    }
+
+    _ = try harness.start(.{ .run = .{ .argv = &.{"cat"}, .stdin = input } });
+    const operation = try harness.nextCompletion();
+    defer harness.table.destroyOperation(operation);
+
+    try testing.expectEqualSlices(u8, input, operation.result.process.stdout);
+    try testing.expectEqual(@as(?u8, 0), operation.result.process.exit_code);
+}
+
+test "missing command fails" {
+    var harness: TestHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+
+    _ = try harness.startRun(&.{"ulsp-no-such-command"});
+    const operation = try harness.nextCompletion();
+    defer harness.table.destroyOperation(operation);
+
+    try testing.expect(operation.result == .failed);
+    try testing.expect(std.mem.startsWith(u8, operation.result.failed, "FileNotFound: ulsp-no-such-command"));
+}
+
+test "cancel kills the child and its group" {
+    var harness: TestHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+
+    // `cat` with an open stdin pipe and nothing written would exit; `sleep` never does.
+    const id = try harness.startRun(&.{ "sh", "-c", "sleep 60 & wait" });
+    try testing.io.sleep(.fromMilliseconds(100), .awake);
+    harness.table.cancel(id);
+
+    try testing.expectEqual(@as(usize, 0), harness.table.operations_by_id.count());
+}
+
+test "a background child holding the pipes does not stall the operation" {
+    var harness: TestHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+
+    _ = try harness.startRun(&.{ "sh", "-c", "sleep 60 & echo hi" });
+    const operation = try harness.nextCompletion();
+    defer harness.table.destroyOperation(operation);
+
+    try testing.expectEqualStrings("hi\n", operation.result.process.stdout);
+}
