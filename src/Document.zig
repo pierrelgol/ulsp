@@ -98,3 +98,52 @@ pub fn replace(document: *Document, start: usize, end: usize, new_text: []const 
         .new_end = new_end_point,
     };
 }
+
+/// Byte offset to row and byte column; clamped to the text.
+/// shortcut: the line functions scan the text, O(size) per call; index line starts if line loops over big files matter.
+pub fn pointAtOffset(document: *const Document, offset: usize) Point {
+    const before = document.text.items[0..@min(offset, document.text.items.len)];
+    const line_start = if (std.mem.lastIndexOfScalar(u8, before, '\n')) |newline| newline + 1 else 0;
+
+    return .{ .row = @intCast(std.mem.count(u8, before, "\n")), .column = @intCast(before.len - line_start) };
+}
+
+pub fn lineCount(document: *const Document) usize {
+    return std.mem.count(u8, document.text.items, "\n") + 1;
+}
+
+/// Byte bounds of line `line_index` without its terminator, or null if out of range.
+pub fn lineBounds(document: *const Document, line_index: usize) ?ByteRange {
+    const text = document.text.items;
+
+    var start: usize = 0;
+    for (0..line_index) |_| {
+        start = (std.mem.indexOfScalarPos(u8, text, start, '\n') orelse return null) + 1;
+    }
+
+    var end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse return .{ .start = start, .end = text.len };
+    if (end > start and text[end - 1] == '\r') {
+        end -= 1;
+    }
+
+    return .{ .start = start, .end = end };
+}
+
+/// `{line, character}` to a byte offset.
+pub fn offsetFromPosition(document: *const Document, encoding: Encoding, position: Position) usize {
+    return offsets.positionToIndex(document.text.items, position, encoding);
+}
+
+/// Byte offset to `{line, character}`; clamped to the text.
+pub fn positionFromOffset(document: *const Document, encoding: Encoding, offset: usize) Position {
+    return offsets.indexToPosition(document.text.items, @min(offset, document.text.items.len), encoding);
+}
+
+pub fn fullRange(document: *const Document, encoding: Encoding) Range {
+    return .{
+        .start = .{ .line = 0, .character = 0 },
+        .end = document.positionFromOffset(encoding, document.text.items.len),
+    };
+}
+
+const testing = std.testing;
