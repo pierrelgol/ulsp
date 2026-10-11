@@ -341,3 +341,71 @@ pub const operation_calls = struct {
         return entries.items;
     }
 };
+
+/// Turns the result of a finished operation into the Lua value `on_completion` receives.
+pub const operation_results = struct {
+    /// Pushes the successful value of a finished operation.
+    pub fn push(lua: *Lua, runtime: *Runtime, result: operations.Result) void {
+        lua.checkStack(8) catch return lua.pushNil();
+
+        switch (result) {
+            .pending, .failed => unreachable,
+            .completed => lua.pushBoolean(true),
+            .bytes => |bytes| _ = lua.pushString(bytes),
+            .process => |process| pushProcess(lua, process),
+            .stat => |maybe_stat| {
+                if (maybe_stat) |stat| {
+                    pushStat(lua, stat);
+                } else {
+                    lua.pushBoolean(false);
+                }
+            },
+            .list => |entries| pushList(lua, runtime, entries),
+        }
+    }
+
+    fn pushProcess(lua: *Lua, process: ProcessResult) void {
+        lua.createTable(0, 4);
+
+        if (process.exit_code) |exit_code| {
+            lua.pushInteger(exit_code);
+            lua.setField(-2, "code");
+        }
+        if (process.signal) |signal| {
+            lua.pushInteger(signal);
+            lua.setField(-2, "signal");
+        }
+
+        _ = lua.pushString(process.stdout);
+        lua.setField(-2, "stdout");
+        _ = lua.pushString(process.stderr);
+        lua.setField(-2, "stderr");
+    }
+
+    fn pushStat(lua: *Lua, stat: FileStat) void {
+        lua.createTable(0, 3);
+
+        _ = lua.pushString(stat.kind);
+        lua.setField(-2, "kind");
+        lua.pushInteger(@intCast(stat.size));
+        lua.setField(-2, "size");
+        lua.pushInteger(stat.mtime_ms);
+        lua.setField(-2, "mtime");
+    }
+
+    fn pushList(lua: *Lua, runtime: *Runtime, entries: []const DirectoryEntry) void {
+        lua.createTable(@intCast(entries.len), 0);
+
+        for (entries, 1..) |entry, position| {
+            lua.createTable(0, 2);
+            _ = lua.pushString(entry.name);
+            lua.setField(-2, "name");
+            _ = lua.pushString(entry.kind);
+            lua.setField(-2, "kind");
+            lua.setIndex(-2, @intCast(position));
+        }
+
+        runtime.tags.push(lua, true);
+        lua.setMetatable(-2);
+    }
+};
