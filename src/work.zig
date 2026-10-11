@@ -132,3 +132,122 @@ fn kindName(kind: File.Kind) []const u8 {
         else => "other",
     };
 }
+
+/// Whatever happens, the child and its group are gone when this returns.
+pub fn runProcess(operation: *Operation, spec: RunSpec) !ProcessResult {
+    const table = operation.table;
+    const gpa = table.gpa;
+    const io = table.io;
+
+    var environment = try table.environ.clone(gpa);
+    defer environment.deinit();
+    for (spec.environment) |entry| {
+        try environment.put(entry[0], entry[1]);
+    }
+
+    var child = try std.process.spawn(io, .{
+        .argv = spec.argv,
+        .cwd = if (spec.cwd) |path| .{ .path = path } else .inherit,
+        .environ_map = &environment,
+        .pgid = 0,
+        .stdin = if (spec.stdin != null) .pipe else .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+
+    // The reader owns the output pipes: `wait` would close them under it.
+    const stdout_file = child.stdout.?;
+    const stderr_file = child.stderr.?;
+    child.stdout = null;
+    child.stderr = null;
+    defer stdout_file.close(io);
+    defer stderr_file.close(io);
+
+    const group = child.id.?; // the child leads its own process group (`pgid = 0`)
+
+    // A second worker reaps the child and then kills its group, so a background process that
+    // inherited the pipes cannot keep the reads below open after the child exited.
+    var waiter = io.concurrent(waitAndKillGroup, .{ &child, io, group }) catch |err| {
+        killGroup(group);
+        child.kill(io);
+        return err;
+    };
+    var waiter_awaited = false;
+    defer if (!waiter_awaited) {
+        killGroup(group);
+        _ = waiter.await(io);
+    };
+
+    var stdin_feeder: Io.Group = .init;
+    defer stdin_feeder.cancel(io);
+    if (spec.stdin) |data| {
+        const stdin_file = child.stdin.?;
+        child.stdin = null;
+        stdin_feeder.concurrent(io, feedAndClose, .{ io, stdin_file, data }) catch |err| {
+            stdin_file.close(io);
+            return err;
+        };
+    }
+
+    var reader_buffer: MultiReader.Buffer(2) = undefined;
+    var reader: MultiReader = undefined;
+    reader.init(gpa, io, reader_buffer.toStreams(), &.{ stdout_file, stderr_file });
+    defer reader.deinit();
+
+    try readUntilEnd(&reader);
+
+    waiter_awaited = true;
+    const term = waiter.await(io) orelse return error.WaitFailed;
+
+    const arena = operation.arena.allocator();
+
+    return .{
+        .stdout = try arena.dupe(u8, reader.reader(0).buffered()),
+        .stderr = try arena.dupe(u8, reader.reader(1).buffered()),
+        .exit_code = switch (term) {
+            .exited => |code| code,
+            else => null,
+        },
+        .signal = switch (term) {
+            .signal => |signal| @intFromEnum(signal),
+            else => null,
+        },
+    };
+}
+
+fn readUntilEnd(reader: *MultiReader) !void {
+    while (reader.fill(64, .none)) |_| {
+        const stdout_length = reader.reader(0).buffered().len;
+        const stderr_length = reader.reader(1).buffered().len;
+        if (stdout_length > ops.max_process_output_bytes or stderr_length > ops.max_process_output_bytes) {
+            return error.StreamTooLong;
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    }
+
+    try reader.checkAnyError();
+}
+
+fn feedAndClose(io: Io, file: File, data: []const u8) void {
+    defer file.close(io);
+
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    writer.interface.writeAll(data) catch return;
+    writer.interface.flush() catch return;
+}
+
+fn killGroup(group: std.process.Child.Id) void {
+    _ = std.c.kill(-group, .KILL);
+}
+
+/// shortcut: the group is killed after the leader was reaped, so its id could in theory have
+/// been reused; the window is microseconds. Use a `waitid(WNOWAIT)` first if that ever matters.
+fn waitAndKillGroup(child: *std.process.Child, io: Io, group: std.process.Child.Id) ?std.process.Child.Term {
+    const term = child.wait(io) catch return null;
+    killGroup(group);
+
+    return term;
+}
