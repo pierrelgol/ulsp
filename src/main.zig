@@ -9,7 +9,9 @@ const server = @import("server.zig");
 const transport = @import("transport.zig");
 const ClientWriter = transport.ClientWriter;
 
-pub const zio_options: zio.Options = .{ .scheduling = .pinned };
+pub const zio_options: zio.Options = .{
+    .scheduling = .pinned,
+};
 
 pub fn main(init: std.process.Init) u8 {
     const gpa = init.gpa;

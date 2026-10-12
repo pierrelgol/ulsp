@@ -13,7 +13,6 @@ const wrap = zlua.wrap;
 pub const DocumentHandle = struct {
     document: *Document,
 
-    /// Takes a new reference on `document`.
     pub fn push(lua: *Lua, runtime: *Runtime, document: *Document) void {
         document.retain();
 

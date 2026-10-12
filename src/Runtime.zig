@@ -1,22 +1,24 @@
 const std = @import("std");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
+
 const zlua = @import("zlua");
-const operations = @import("ops.zig");
-const transport = @import("transport.zig");
-const ClientWriter = transport.ClientWriter;
-const DocumentStore = @import("text.zig").DocumentStore;
-const OperationTable = @import("ops.zig").OperationTable;
-const Operation = @import("ops.zig").Operation;
-const Trees = @import("syntax.zig").Trees;
-const Tags = @import("lua.zig").convert.Tags;
+const Lua = zlua.Lua;
+
 const core = @import("lua.zig").core;
 const document_calls = core.document_calls;
 const embedded_lua = core.embedded_lua;
 const lua_calls = core.lua_calls;
+const DocumentStore = @import("text.zig").DocumentStore;
+const Operation = @import("ops.zig").Operation;
+const operations = @import("ops.zig");
+const OperationTable = @import("ops.zig").OperationTable;
+const Tags = @import("lua.zig").convert.Tags;
+const transport = @import("transport.zig");
+const ClientWriter = transport.ClientWriter;
+const Trees = @import("syntax.zig").Trees;
 
 const Runtime = @This();
-const Lua = zlua.Lua;
-const Io = std.Io;
-const Allocator = std.mem.Allocator;
 
 const native_gc_threshold_bytes = 64 * 1024 * 1024;
 const log_level_names = [_][]const u8{ "error", "warn", "info", "debug" };
@@ -27,7 +29,10 @@ pub const Hooks = struct {
     reject: *const fn (*Runtime, std.json.Value, []const u8) void,
 };
 
-pub const StartError = error{ OutOfMemory, EmbeddedLuaFailed };
+pub const StartError = error{
+    OutOfMemory,
+    EmbeddedLuaFailed,
+};
 
 gpa: Allocator,
 io: Io,
