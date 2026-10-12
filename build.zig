@@ -60,6 +60,35 @@ pub fn build(b: *std.Build) void {
     install_config.addFileArg(b.path("tools/lua/config.lua"));
     b.getInstallStep().dependOn(&install_config.step);
 
+    // Every grammar of neurocyte/tree-sitter becomes a shared library, loaded at run time with
+    // `ulsp.ts.load(name, path)`, and goes to `<config>/runtime/parsers` with its queries in `runtime/queries`.
+    const grammars = b.dependency("grammars", .{});
+    const runtime = b.addRunArtifact(config_tool);
+    runtime.addArg("replace");
+    for (grammars_list) |grammar| {
+        const lang, const sub, const name = grammar;
+        const base = b.fmt("tree-sitter-{s}", .{lang});
+        const src = if (sub.len > 0) b.fmt("{s}/{s}/src", .{ base, sub }) else b.fmt("{s}/src", .{base});
+
+        const module = b.createModule(.{ .target = target, .optimize = .ReleaseSmall, .link_libc = true, .pic = true });
+        module.addCSourceFile(.{ .file = grammars.path(b.fmt("{s}/parser.c", .{src})), .flags = &.{"-fno-sanitize=undefined"} });
+        if (exists(grammars.builder, b.fmt("{s}/scanner.c", .{src})))
+            module.addCSourceFile(.{ .file = grammars.path(b.fmt("{s}/scanner.c", .{src})), .flags = &.{"-fno-sanitize=undefined"} });
+        module.addIncludePath(grammars.path(src));
+        const library = b.addLibrary(.{ .name = name, .linkage = .dynamic, .root_module = module });
+        runtime.addArg(b.fmt("runtime/parsers/{s}", .{library.out_filename}));
+        runtime.addFileArg(library.getEmittedBin());
+
+        const queries = if (sub.len == 0 and exists(grammars.builder, b.fmt("queries/{s}", .{lang})))
+            b.fmt("queries/{s}", .{lang})
+        else if (sub.len > 0) b.fmt("{s}/{s}/queries", .{ base, sub }) else b.fmt("{s}/queries", .{base});
+        if (exists(grammars.builder, queries)) {
+            runtime.addArg(b.fmt("runtime/queries/{s}", .{name}));
+            runtime.addDirectoryArg(grammars.path(queries));
+        }
+    }
+    b.getInstallStep().dependOn(&runtime.step);
+
     const run_step = b.step("run", "Run the app");
 
     const run_cmd = b.addRunArtifact(exe);

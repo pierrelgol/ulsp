@@ -20,6 +20,10 @@
             .url = "git+https://github.com/tree-sitter/zig-tree-sitter#b562510b5563dcf3b7fcac4a5fe9d60834c84667",
             .hash = "tree_sitter-0.26.0-8heIf-vDAQDh0HhAAUVwVZFmLrwSKMZl5gRaVFqtas0W",
         },
+        .grammars = .{
+            .url = "https://github.com/neurocyte/tree-sitter/releases/download/zig-0.16-b3effa2d11a93447516781273a88ba621cc2617d/source.tar.gz",
+            .hash = "tree_sitter-0.26.7-z0LhyBp76zOKagDB_wh0Cv10DpWo-dAK9DkCio_GahLP",
+        },
     },
     .paths = .{
         "build.zig",
