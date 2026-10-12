@@ -1,5 +1,3 @@
-//! Plain Lua-callable functions: client, json, uri and operations, plus pushing operation results.
-
 const convert = @import("convert.zig");
 const std = @import("std");
 const zlua = @import("zlua");
@@ -17,11 +15,9 @@ const Lua = zlua.Lua;
 const Allocator = std.mem.Allocator;
 const Arena = std.heap.ArenaAllocator;
 
-/// The JSON text of the Lua value at index 1, owned by the caller.
 fn encodeArgument(lua: *Lua, runtime: *Runtime) []u8 {
     lua.checkAny(1);
 
-    // Raise only after the arena is gone: a Lua error longjmps over `defer`.
     var arena: std.heap.ArenaAllocator = .init(runtime.gpa);
     const encoded: convert.Error![]u8 = blk: {
         defer arena.deinit();
@@ -34,7 +30,6 @@ fn encodeArgument(lua: *Lua, runtime: *Runtime) []u8 {
     return encoded catch |err| raise.text(lua, convert.errorText(err));
 }
 
-/// `core` functions that talk to the client or the process: send, log, exit, set_encoding.
 pub const client_calls = struct {
     pub fn send(lua: *Lua) i32 {
         const runtime = Runtime.of(lua);
@@ -81,7 +76,6 @@ pub const client_calls = struct {
     }
 };
 
-/// `core.json_encode`, `core.json_decode`, `core.array` and `core.object`.
 pub const json_calls = struct {
     pub fn encode(lua: *Lua) i32 {
         const runtime = Runtime.of(lua);
@@ -100,7 +94,6 @@ pub const json_calls = struct {
             raise.text(lua, "ulsp.json.decode: nested too deeply");
         }
 
-        // Raise only after the arena is gone: a Lua error longjmps over `defer`.
         var arena: std.heap.ArenaAllocator = .init(runtime.gpa);
         const failure_message: ?[]const u8 = blk: {
             defer arena.deinit();
@@ -119,7 +112,6 @@ pub const json_calls = struct {
         return 1;
     }
 
-    /// `core.array(t)` / `core.object(t)`: tags `t` (or a new table) as a JSON array or object.
     pub fn markShape(comptime is_array: bool) fn (*Lua) i32 {
         return struct {
             fn mark(lua: *Lua) i32 {
@@ -140,7 +132,6 @@ pub const json_calls = struct {
     }
 };
 
-/// `core.uri_to_path` and `core.uri_from_path`.
 pub const uri_calls = struct {
     pub fn toPath(lua: *Lua) i32 {
         const runtime = Runtime.of(lua);
@@ -171,8 +162,6 @@ pub const uri_calls = struct {
     }
 };
 
-/// `core.op_*`: start and cancel operations. A raise skips `defer`, so every
-/// arena is freed before one.
 pub const operation_calls = struct {
     const RunSpecError = error{ BadCommand, BadStdin, BadCwd, BadEnvironment, OutOfMemory };
 
@@ -186,7 +175,6 @@ pub const operation_calls = struct {
         return startOperation(lua, runtime, .init(runtime.gpa), .{ .sleep = @intFromFloat(@min(milliseconds, operations.max_sleep_ms)) });
     }
 
-    /// `read`, `stat` and `list` take one path.
     pub fn startPathOperation(comptime kind: []const u8) fn (*Lua) i32 {
         return struct {
             fn start(lua: *Lua) i32 {
@@ -239,7 +227,6 @@ pub const operation_calls = struct {
         return 0;
     }
 
-    /// Takes ownership of `arena`, which holds the memory of `spec`.
     fn startOperation(lua: *Lua, runtime: *Runtime, arena: Arena, spec: operations.Spec) i32 {
         const id = runtime.operation_table.start(arena, spec) catch |err| {
             raise.formatted(lua, "ulsp: cannot start operation: {s}", .{@errorName(err)});
@@ -249,7 +236,6 @@ pub const operation_calls = struct {
         return 1;
     }
 
-    /// Copies `text` into `arena`; frees the arena before raising.
     fn copyOrRaise(lua: *Lua, arena: *Arena, text: []const u8) []const u8 {
         return arena.allocator().dupe(u8, text) catch {
             arena.deinit();
@@ -267,8 +253,6 @@ pub const operation_calls = struct {
         };
     }
 
-    /// Reads the spec table at index 1 into `arena`. Raises nothing; the caller frees the arena on
-    /// error.
     fn readRunSpec(lua: *Lua, arena: Allocator) RunSpecError!RunSpec {
         lua.checkStack(8) catch return error.OutOfMemory;
 
@@ -304,7 +288,6 @@ pub const operation_calls = struct {
         return argv.items;
     }
 
-    /// The string in field `name` of the spec table, or null when absent.
     fn readOptionalString(lua: *Lua, arena: Allocator, name: [:0]const u8, bad_type: RunSpecError) RunSpecError!?[]const u8 {
         defer lua.pop(1);
 
@@ -342,9 +325,7 @@ pub const operation_calls = struct {
     }
 };
 
-/// Turns the result of a finished operation into the Lua value `on_completion` receives.
 pub const operation_results = struct {
-    /// Pushes the successful value of a finished operation.
     pub fn push(lua: *Lua, runtime: *Runtime, result: operations.Result) void {
         lua.checkStack(8) catch return lua.pushNil();
 

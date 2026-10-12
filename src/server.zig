@@ -1,18 +1,13 @@
-/// Message entry point: parsing, the three document notifications, rejection replies.
-/// Knows no other LSP method.
 const std = @import("std");
 const Document = @import("text.zig").Document;
 const json_validation = @import("lua.zig").convert;
 const lua_calls = @import("lua.zig").core.lua_calls;
 const Runtime = @import("Runtime.zig");
-
 const Allocator = std.mem.Allocator;
 
+const Notification = enum { didOpen, didChange, didClose };
 pub const parse_error = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}";
 
-const Notification = enum { didOpen, didChange, didClose };
-
-/// The caller frees `bytes`.
 pub fn onMessage(runtime: *Runtime, bytes: []const u8) void {
     var arena: std.heap.ArenaAllocator = .init(runtime.gpa);
     defer arena.deinit();
@@ -44,7 +39,6 @@ pub fn onMessage(runtime: *Runtime, bytes: []const u8) void {
     }
 }
 
-/// A request that never reaches Lua still gets an answer (a missing reply hangs the client).
 pub fn rejectUnconvertible(runtime: *Runtime, message: std.json.Value, text: []const u8) void {
     if (message != .object) {
         return;
@@ -62,7 +56,6 @@ pub fn rejectUnconvertible(runtime: *Runtime, message: std.json.Value, text: []c
     runtime.client_writer.pushOwned(runtime.io, bytes);
 }
 
-/// Which of the three document notifications `message` is, if any.
 fn classify(message: std.json.Value) ?Notification {
     if (message != .object or message.object.contains("id")) {
         return null;
@@ -91,7 +84,6 @@ test "classify tells notifications from requests" {
 
 const Position = struct { line: i64, character: i64 };
 
-/// One entry of `contentChanges`: a ranged edit, or a whole-text replacement when `range` is null.
 const Change = struct {
     range: ?struct { start: Position, end: Position } = null,
     text: []const u8,
@@ -110,7 +102,6 @@ const CloseParams = struct {
     textDocument: struct { uri: []const u8 },
 };
 
-/// The notification's `params` as `T`, or a logged warning and null.
 fn parseParams(comptime T: type, runtime: *Runtime, arena: Allocator, message: std.json.Value, name: []const u8) ?T {
     if (message.object.get("params")) |params| {
         if (std.json.parseFromValueLeaky(T, arena, params, .{ .ignore_unknown_fields = true })) |parsed| {
@@ -127,7 +118,6 @@ pub fn applyOpen(runtime: *Runtime, arena: Allocator, message: std.json.Value) v
     const params = parseParams(OpenParams, runtime, arena, message, "didOpen") orelse return;
     const item = params.textDocument;
 
-    // A reopen without didClose must not reuse the old tree.
     runtime.trees.dropDocument(item.uri);
     runtime.documents.open(item.uri, item.languageId, item.version, item.text) catch {
         warn(runtime, "didOpen: out of memory", .{});
@@ -137,7 +127,6 @@ pub fn applyOpen(runtime: *Runtime, arena: Allocator, message: std.json.Value) v
 pub fn applyChange(runtime: *Runtime, arena: Allocator, message: std.json.Value) void {
     const params = parseParams(ChangeParams, runtime, arena, message, "didChange") orelse return;
 
-    // Validate everything first so a malformed entry leaves the document untouched.
     for (params.contentChanges) |change| {
         const range = change.range orelse continue;
         if (@min(range.start.line, range.start.character, range.end.line, range.end.character) < 0) {

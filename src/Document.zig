@@ -1,6 +1,3 @@
-//! A reference-counted document. The store holds one reference while the document is open;
-//! every Lua handle holds one more. `closed` is set when the store lets go of it.
-//! Loop thread only.
 const std = @import("std");
 const offsets = @import("lsp").offsets;
 const root = @import("text.zig");
@@ -18,7 +15,6 @@ pub const Range = offsets.Range;
 gpa: Allocator,
 refs: usize = 1,
 closed: bool = false,
-/// An immutable copy made by `snapshot`: never in the store, never edited.
 is_snapshot: bool = false,
 uri: []u8,
 language: []u8,
@@ -41,7 +37,6 @@ pub fn create(gpa: Allocator, uri: []const u8, language: []const u8, version: i6
     return document;
 }
 
-/// A private copy of the text as it is now, owned by the caller (one reference).
 pub fn snapshot(document: *const Document) Allocator.Error!*Document {
     const copy = try create(document.gpa, document.uri, document.language, document.version, document.bytes());
     copy.is_snapshot = true;
@@ -99,8 +94,6 @@ pub fn replace(document: *Document, start: usize, end: usize, new_text: []const 
     };
 }
 
-/// Byte offset to row and byte column; clamped to the text.
-/// shortcut: the line functions scan the text, O(size) per call; index line starts if line loops over big files matter.
 pub fn pointAtOffset(document: *const Document, offset: usize) Point {
     const before = document.text.items[0..@min(offset, document.text.items.len)];
     const line_start = if (std.mem.lastIndexOfScalar(u8, before, '\n')) |newline| newline + 1 else 0;
@@ -112,7 +105,6 @@ pub fn lineCount(document: *const Document) usize {
     return std.mem.count(u8, document.text.items, "\n") + 1;
 }
 
-/// Byte bounds of line `line_index` without its terminator, or null if out of range.
 pub fn lineBounds(document: *const Document, line_index: usize) ?ByteRange {
     const text = document.text.items;
 
@@ -129,12 +121,10 @@ pub fn lineBounds(document: *const Document, line_index: usize) ?ByteRange {
     return .{ .start = start, .end = end };
 }
 
-/// `{line, character}` to a byte offset.
 pub fn offsetFromPosition(document: *const Document, encoding: Encoding, position: Position) usize {
     return offsets.positionToIndex(document.text.items, position, encoding);
 }
 
-/// Byte offset to `{line, character}`; clamped to the text.
 pub fn positionFromOffset(document: *const Document, encoding: Encoding, offset: usize) Position {
     return offsets.indexToPosition(document.text.items, @min(offset, document.text.items.len), encoding);
 }
@@ -180,7 +170,6 @@ test "offset clamps" {
 }
 
 test "utf-8 vs utf-16" {
-    // "a", U+00E9 (2 bytes, 1 unit), U+1F600 (4 bytes, 2 units), "z"
     const document = try createTestDocument("a\u{e9}\u{1F600}z");
     defer document.release();
 

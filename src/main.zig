@@ -1,10 +1,13 @@
 const std = @import("std");
-const zio = @import("zio");
+const log = std.log;
+
 const lsp = @import("lsp");
-const transport = @import("transport.zig");
-const ClientWriter = transport.ClientWriter;
+const zio = @import("zio");
+
 const Runtime = @import("Runtime.zig");
 const server = @import("server.zig");
+const transport = @import("transport.zig");
+const ClientWriter = transport.ClientWriter;
 
 pub const zio_options: zio.Options = .{ .scheduling = .pinned };
 
@@ -13,14 +16,14 @@ pub fn main(init: std.process.Init) u8 {
 
     // The main thread is the loop thread; tasks run on two other executors.
     const zio_runtime = zio.Runtime.init(gpa, .{ .executors = .exact(2), .enable_main_executor = false }) catch {
-        std.debug.print("ulsp: cannot start the runtime\n", .{});
+        log.err("ulsp: cannot start the runtime\n", .{});
         return 2;
     };
     defer zio_runtime.deinit();
     const io = zio_runtime.io();
 
     const streams = transport.isolateProtocolStreams() catch {
-        std.debug.print("ulsp: cannot set up the protocol streams\n", .{});
+        log.err("ulsp: cannot set up the protocol streams\n", .{});
         return 2;
     };
 
@@ -29,21 +32,27 @@ pub fn main(init: std.process.Init) u8 {
 
     var client_writer: ClientWriter = .{ .gpa = gpa, .transport = &stdio_transport.transport };
     client_writer.start(io) catch {
-        std.debug.print("ulsp: cannot start the writer\n", .{});
+        log.err("ulsp: cannot start the writer\n", .{});
         return 2;
     };
 
-    const runtime = Runtime.create(gpa, io, init.environ_map, &client_writer, .{
-        .on_message = server.onMessage,
-        .reject = server.rejectUnconvertible,
-    }) catch |err| {
-        std.debug.print("ulsp: startup failed: {s}\n", .{@errorName(err)});
+    const runtime = Runtime.create(
+        gpa,
+        io,
+        init.environ_map,
+        &client_writer,
+        .{
+            .on_message = server.onMessage,
+            .reject = server.rejectUnconvertible,
+        },
+    ) catch |err| {
+        log.err("ulsp: startup failed: {s}\n", .{@errorName(err)});
         client_writer.finish(io);
         return 2;
     };
 
     var reader = io.concurrent(transport.readLoop, .{ io, gpa, &stdio_transport.transport, &runtime.queue }) catch {
-        std.debug.print("ulsp: cannot start the reader\n", .{});
+        log.err("ulsp: cannot start the reader\n", .{});
         client_writer.finish(io);
         runtime.destroy();
         return 2;

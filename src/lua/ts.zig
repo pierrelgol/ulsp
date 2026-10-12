@@ -1,5 +1,3 @@
-//! Lua's view of tree-sitter: the userdata boxes (language, tree, node, query) and their methods.
-
 const convert = @import("convert.zig");
 const document_calls = @import("document.zig").document_calls;
 const std = @import("std");
@@ -17,14 +15,12 @@ const raise = convert.raise;
 const positions = convert.positions;
 const wrap = zlua.wrap;
 
-/// The userdata behind a tree-sitter node. Holds one reference to the tree that owns the node.
 pub const NodeBox = struct {
     pub const metatable_name = "ulsp.ts.node";
 
     node: ts.Node,
     shared_tree: *SharedTree,
 
-    /// Takes one new reference on `shared_tree`.
     pub fn push(lua: *Lua, shared_tree: *SharedTree, node: ts.Node) void {
         const box = lua.newUserdata(NodeBox, 0);
         shared_tree.retain();
@@ -59,7 +55,6 @@ pub const NodeBox = struct {
         return 1;
     }
 
-    /// The node's byte bounds, clamped to the text so a bad tree cannot slice out of range.
     pub fn byteBounds(box: *const NodeBox) struct { start: usize, end: usize } {
         const text_length = box.shared_tree.text.len;
         const start = @min(box.node.startByte(), text_length);
@@ -75,13 +70,11 @@ pub const NodeBox = struct {
     }
 };
 
-/// The userdata behind a tree handle. Holds one reference to the shared tree.
 pub const TreeBox = struct {
     pub const metatable_name = "ulsp.ts.tree";
 
     shared_tree: *SharedTree,
 
-    /// Takes one new reference on `shared_tree`.
     pub fn push(lua: *Lua, shared_tree: *SharedTree) void {
         const box = lua.newUserdata(TreeBox, 0);
         shared_tree.retain();
@@ -111,7 +104,6 @@ pub const TreeBox = struct {
     }
 };
 
-/// The userdata behind a tree-sitter language value. Languages live as long as the process.
 pub const LanguageBox = struct {
     pub const metatable_name = "ulsp.ts.language";
 
@@ -123,7 +115,6 @@ pub const LanguageBox = struct {
         lua.setMetatableRegistry(metatable_name);
     }
 
-    /// A language value or the name of a loaded language.
     pub fn argument(lua: *Lua, runtime: *Runtime, index: i32) *Language {
         if (lua.typeOf(index) == .string) {
             const name = lua.toString(index) catch unreachable;
@@ -143,7 +134,6 @@ pub const LanguageBox = struct {
     }
 };
 
-/// The userdata behind a compiled tree-sitter query.
 pub const QueryBox = struct {
     pub const metatable_name = "ulsp.ts.query";
 
@@ -172,7 +162,6 @@ pub const QueryBox = struct {
     }
 };
 
-/// A query runs on the loop thread, so it gets a time budget; generous enough for any real query.
 pub const QueryBudget = struct {
     const budget_ms = 2000;
     io: std.Io,
@@ -186,7 +175,6 @@ pub const QueryBudget = struct {
         };
     }
 
-    /// Starts `cursor` on `node`; the budget must outlive the cursor.
     pub fn execute(budget: *QueryBudget, cursor: *ts.QueryCursor, query: *ts.Query, node: ts.Node) void {
         cursor.execWithOptions(query, node, &.{ .payload = budget, .progress_callback = checkDeadline });
     }
@@ -203,8 +191,6 @@ pub const QueryBudget = struct {
     }
 };
 
-/// The methods of tree-sitter node handles The generated functions take the
-/// tree-sitter method name, which must stay as the library spells it.
 pub const node_calls = struct {
     pub const methods = .{
         .{ "type", nodeType },
@@ -234,8 +220,6 @@ pub const node_calls = struct {
         .{ "sexp", nodeSexp },
     };
 
-    /// Character offset of `byte` on its line, in `encoding`; `column` is the byte column from
-    /// tree-sitter.
     pub fn characterOnLine(text: []const u8, encoding: Document.Encoding, byte: u32, column: u32) u32 {
         const line_start = byte - @min(column, byte);
 
@@ -325,7 +309,6 @@ pub const node_calls = struct {
         }.call;
     }
 
-    /// `node:child(i)` counts from 1.
     fn childAtMethod(comptime method: []const u8) fn (*Lua) i32 {
         return struct {
             fn call(lua: *Lua) i32 {
@@ -351,7 +334,6 @@ pub const node_calls = struct {
 
                 lua.createTable(@intCast(child_count), 0);
 
-                // shortcut: child(i) is O(i); use a tree cursor if very wide nodes show up.
                 var child_index: u32 = 0;
                 while (child_index < child_count) : (child_index += 1) {
                     const child = @field(ts.Node, method)(box.node, child_index) orelse break;
@@ -411,7 +393,6 @@ pub const node_calls = struct {
     }
 };
 
-/// `core.ts_query` and the methods of query handles.
 pub const query_calls = struct {
     pub const methods = .{
         .{ "captures", captures },
@@ -456,7 +437,6 @@ pub const query_calls = struct {
         return .{ .query_box = query_box, .node_box = node_box };
     }
 
-    /// A Lua error longjmps over `defer`, so the cursor is destroyed before the raise.
     fn raiseTimedOut(lua: *Lua, cursor: *ts.QueryCursor) noreturn {
         cursor.destroy();
         raise.text(lua, "ulsp: query timed out");
@@ -525,7 +505,6 @@ pub const query_calls = struct {
         return 1;
     }
 
-    /// Adds `capture` to the match table on top of the stack; the first capture of a name wins.
     fn pushCaptureIfNew(lua: *Lua, query_box: *const QueryBox, node_box: *const NodeBox, capture: ts.Query.Capture) void {
         const name = query_box.captureName(capture.index);
 
@@ -556,10 +535,7 @@ pub const query_calls = struct {
     }
 };
 
-/// Tree-sitter `core` functions and the registration of the four handle metatables.
-/// Each function reads its arguments, works, then pushes. Nothing here waits.
 pub const ts_calls = struct {
-    /// Creates the four metatables and adds the `ts_*` functions to the `core` table on top.
     pub fn register(lua: *Lua) void {
         inline for (.{
             .{ "ts_load", load },
@@ -581,7 +557,6 @@ pub const ts_calls = struct {
         registerMetatable(lua, QueryBox.metatable_name, query_calls.methods, QueryBox.release, null);
     }
 
-    /// `gc` and `equal` may be null.
     fn registerMetatable(lua: *Lua, name: [:0]const u8, comptime methods: anytype, comptime gc: anytype, comptime equal: anytype) void {
         lua.newMetatable(name) catch unreachable;
 
@@ -654,7 +629,6 @@ pub const ts_calls = struct {
 
         const shared_tree = runtime.trees.parse(parse_language, text, null) catch |err| raiseParseError(lua, err);
         TreeBox.push(lua, shared_tree);
-        // The handle took its own reference.
         shared_tree.release();
         runtime.noteNativeBytes(text.len);
 
@@ -665,7 +639,6 @@ pub const ts_calls = struct {
         const runtime = Runtime.of(lua);
         const tree_language = LanguageBox.argument(lua, runtime, 2);
 
-        // A uri names the live document; a handle (live or snapshot) names exactly that text.
         const document = if (lua.typeOf(1) == .userdata)
             document_calls.documentArgument(lua, runtime, 1)
         else
@@ -678,7 +651,6 @@ pub const ts_calls = struct {
         TreeBox.push(lua, shared_tree);
         shared_tree.release();
 
-        // A snapshot's tree is not in the cache: only Lua keeps it alive, so count it for the GC.
         if (document.is_snapshot) {
             runtime.noteNativeBytes(document.bytes().len * 4);
         }

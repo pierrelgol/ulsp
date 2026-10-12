@@ -1,5 +1,3 @@
-//! The `ulsp` module table, calling into Lua (handlers, completions) and loading the embedded Lua sources.
-
 const convert = @import("convert.zig");
 const api = @import("api.zig");
 pub const document_calls = @import("document.zig").document_calls;
@@ -13,11 +11,9 @@ const zlua = @import("zlua");
 const std = @import("std");
 const Operation = @import("../ops.zig").Operation;
 const Runtime = @import("../Runtime.zig");
-
 const Lua = zlua.Lua;
 const wrap = zlua.wrap;
 
-/// Pushes a fresh `core` table. `runtime.document_metatable_ref` must already be set.
 pub fn push(lua: *Lua) void {
     lua.createTable(0, 32);
 
@@ -51,21 +47,16 @@ pub fn push(lua: *Lua) void {
     lua.setField(-2, "null");
 }
 
-/// The two ways the loop enters Lua: `on_message` and `on_completion`.
-/// Both run inside a protected call with a traceback handler, so an error in Lua is logged and
-/// the loop goes on.
 pub const lua_calls = struct {
     const Call = union(enum) {
         message: std.json.Value,
         completion: *Operation,
     };
 
-    /// Calls `on_message(value)`.
     pub fn callOnMessage(runtime: *Runtime, value: std.json.Value) void {
         protectedEntry(runtime, &.{ .message = value });
     }
 
-    /// Calls `on_completion(id, ok, result)`.
     pub fn callOnCompletion(runtime: *Runtime, operation: *Operation) void {
         protectedEntry(runtime, &.{ .completion = operation });
     }
@@ -102,8 +93,6 @@ pub const lua_calls = struct {
         return 1;
     }
 
-    /// Runs inside the protected call: pushes the arguments (so a failed push is caught too) and
-    /// calls the stored Lua function.
     fn enter(lua: *Lua) i32 {
         const runtime = Runtime.of(lua);
         const call: *const Call = @ptrCast(@alignCast(lua.toPointer(1).?));
@@ -146,9 +135,7 @@ pub const lua_calls = struct {
     }
 };
 
-/// Runs async.lua and prelude.lua, read from `$ULSP_LUA` or `<binary dir>/../share/ulsp/lua`.
 pub const embedded_lua = struct {
-    /// Expects `core` on top of the stack; pops it.
     pub fn load(runtime: *Runtime) error{ OutOfMemory, EmbeddedLuaFailed }!void {
         const lua = runtime.lua;
         defer lua.setTop(0);
@@ -160,7 +147,6 @@ pub const embedded_lua = struct {
         try loadFile(runtime, arena.allocator(), directory, "async.lua");
         lua.pushValue(1);
         lua.protectedCall(.{ .args = 1, .results = 1 }) catch return error.EmbeddedLuaFailed;
-        // stack: core, scheduler
 
         try loadFile(runtime, arena.allocator(), directory, "prelude.lua");
         lua.pushValue(1);

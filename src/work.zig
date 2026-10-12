@@ -1,5 +1,3 @@
-//! What workers do: the task of one operation, file operations and child
-//! processes. Runs off the loop thread.
 const std = @import("std");
 const ops = @import("ops.zig");
 
@@ -37,7 +35,6 @@ fn perform(operation: *Operation) !ops.Result {
     const arena = operation.arena.allocator();
 
     switch (operation.spec) {
-        // A timer of the table, never a worker.
         .sleep => unreachable,
         .run => |spec| return .{ .process = try runProcess(operation, spec) },
         .read => |path| return .{ .bytes = try readFile(io, arena, path) },
@@ -68,8 +65,6 @@ pub fn readFile(io: Io, arena: Allocator, path: []const u8) ![]u8 {
     return Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(ops.max_read_bytes));
 }
 
-/// Temp file + rename: a cancel mid-write leaves the old file intact. A symlink is followed so
-/// the rename replaces the target, not the link.
 pub fn writeFileAtomic(io: Io, arena: Allocator, path: []const u8, data: []const u8) !void {
     const cwd = Io.Dir.cwd();
     const target_path = cwd.realPathFileAlloc(io, path, arena) catch path;
@@ -90,7 +85,6 @@ pub fn writeFileAtomic(io: Io, arena: Allocator, path: []const u8, data: []const
     try atomic.replace(io);
 }
 
-/// Null when the path does not exist. Symlinks are not followed.
 pub fn statPath(io: Io, path: []const u8) !?FileStat {
     const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return null,
@@ -104,7 +98,6 @@ pub fn statPath(io: Io, path: []const u8) !?FileStat {
     };
 }
 
-/// The entries of `path`, sorted by name.
 pub fn listDirectory(io: Io, arena: Allocator, path: []const u8) ![]DirectoryEntry {
     var directory = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
     defer directory.close(io);
@@ -133,7 +126,6 @@ fn kindName(kind: File.Kind) []const u8 {
     };
 }
 
-/// Whatever happens, the child and its group are gone when this returns.
 pub fn runProcess(operation: *Operation, spec: RunSpec) !ProcessResult {
     const table = operation.table;
     const gpa = table.gpa;
@@ -155,7 +147,6 @@ pub fn runProcess(operation: *Operation, spec: RunSpec) !ProcessResult {
         .stderr = .pipe,
     });
 
-    // The reader owns the output pipes: `wait` would close them under it.
     const stdout_file = child.stdout.?;
     const stderr_file = child.stderr.?;
     child.stdout = null;
@@ -163,10 +154,8 @@ pub fn runProcess(operation: *Operation, spec: RunSpec) !ProcessResult {
     defer stdout_file.close(io);
     defer stderr_file.close(io);
 
-    const group = child.id.?; // the child leads its own process group (`pgid = 0`)
+    const group = child.id.?;
 
-    // A second worker reaps the child and then kills its group, so a background process that
-    // inherited the pipes cannot keep the reads below open after the child exited.
     var waiter = io.concurrent(waitAndKillGroup, .{ &child, io, group }) catch |err| {
         killGroup(group);
         child.kill(io);
@@ -243,8 +232,6 @@ fn killGroup(group: std.process.Child.Id) void {
     _ = std.c.kill(-group, .KILL);
 }
 
-/// shortcut: the group is killed after the leader was reaped, so its id could in theory have
-/// been reused; the window is microseconds. Use a `waitid(WNOWAIT)` first if that ever matters.
 fn waitAndKillGroup(child: *std.process.Child, io: Io, group: std.process.Child.Id) ?std.process.Child.Term {
     const term = child.wait(io) catch return null;
     killGroup(group);
@@ -394,7 +381,6 @@ test "cancel kills the child and its group" {
     harness.init();
     defer harness.deinit();
 
-    // `cat` with an open stdin pipe and nothing written would exit; `sleep` never does.
     const id = try harness.startRun(&.{ "sh", "-c", "sleep 60 & wait" });
     try testing.io.sleep(.fromMilliseconds(100), .awake);
     harness.table.cancel(id);

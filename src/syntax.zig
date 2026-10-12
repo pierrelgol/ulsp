@@ -1,14 +1,10 @@
-//! Tree-sitter host: grammars loaded at run time and the parse-tree cache.
-//! Knows no Lua.
 const std = @import("std");
 const ts = @import("zts");
-
 const Allocator = std.mem.Allocator;
 const DynLib = std.DynLib;
 const Document = @import("text.zig").Document;
 const Edit = @import("text.zig").Edit;
 
-/// A grammar. Never freed before exit, and its library is never unloaded.
 pub const Language = struct {
     name: []u8,
     path: []u8,
@@ -16,7 +12,6 @@ pub const Language = struct {
     library: DynLib,
 };
 
-/// A parsed tree with the text it was parsed from, shared by the cache, tree handles and nodes.
 pub const SharedTree = struct {
     gpa: Allocator,
     refs: usize = 1,
@@ -24,10 +19,7 @@ pub const SharedTree = struct {
     text: []u8,
     language: *Language,
     version: i64 = 0,
-    /// Cache entries only: a private copy of `tree` with every edit since `version` applied,
-    /// the old tree for the next parse. `tree` itself stays untouched (Lua may hold nodes).
     base: ?*ts.Tree = null,
-    /// A whole-text change happened since `version`: `base` cannot be trusted.
     base_invalid: bool = false,
 
     pub fn retain(shared_tree: *SharedTree) void {
@@ -57,7 +49,6 @@ pub const Trees = struct {
 
     gpa: Allocator,
     languages_by_name: std.StringHashMapUnmanaged(*Language) = .empty,
-    /// Key: `<uri> 0x00 <language name>`.
     cache: std.StringHashMapUnmanaged(*SharedTree) = .empty,
 
     pub fn deinit(trees: *Trees) void {
@@ -81,7 +72,6 @@ pub const Trees = struct {
         return trees.languages_by_name.get(name);
     }
 
-    /// `ulsp.ts.load`: returns the existing language when `name` is already loaded.
     pub fn loadLanguage(trees: *Trees, name: []const u8, path: []const u8) LoadError!*Language {
         if (trees.findLanguage(name)) |loaded_language| {
             return loaded_language;
@@ -117,8 +107,6 @@ pub const Trees = struct {
         return language;
     }
 
-    /// A new tree with one reference, owned by the caller. `previous_tree` is an edited tree of the
-    /// previous text.
     pub fn parse(trees: *Trees, language: *Language, text: []const u8, previous_tree: ?*const ts.Tree) ParseError!*SharedTree {
         const text_copy = try trees.gpa.dupe(u8, text);
         errdefer trees.gpa.free(text_copy);
@@ -126,7 +114,6 @@ pub const Trees = struct {
         const shared_tree = try trees.gpa.create(SharedTree);
         errdefer trees.gpa.destroy(shared_tree);
 
-        // shortcut: one parser per parse; keep one per language if parse rate ever matters.
         const parser = ts.Parser.create();
         defer parser.destroy();
         parser.setLanguage(language.tree_sitter_language) catch return error.ParseFailed;
@@ -137,7 +124,6 @@ pub const Trees = struct {
         return shared_tree;
     }
 
-    /// The tree for `document` at its current version; one reference is owned by the caller.
     pub fn treeForDocument(trees: *Trees, document: *const Document, language: *Language) ParseError!*SharedTree {
         const key = try std.fmt.allocPrint(trees.gpa, "{s}\x00{s}", .{ document.uri, language.name });
         defer trees.gpa.free(key);
@@ -150,7 +136,6 @@ pub const Trees = struct {
             }
         }
 
-        // A snapshot of another version must not displace the live document's cached tree.
         if (document.is_snapshot) {
             const snapshot_tree = try trees.parse(language, document.bytes(), null);
             snapshot_tree.version = document.version;
@@ -174,7 +159,6 @@ pub const Trees = struct {
         return fresh_tree;
     }
 
-    /// Records an incremental edit of `uri` for the next parse of each of its cached trees.
     pub fn recordEdit(trees: *Trees, uri: []const u8, edit: Edit) void {
         const input_edit = inputEditFromEdit(edit);
 
@@ -195,7 +179,6 @@ pub const Trees = struct {
         }
     }
 
-    /// A whole-text change of `uri`: the cached trees cannot seed the next parse.
     pub fn invalidateBases(trees: *Trees, uri: []const u8) void {
         var iterator = trees.cache.iterator();
         while (iterator.next()) |entry| {
@@ -205,7 +188,6 @@ pub const Trees = struct {
         }
     }
 
-    /// Drops every entry of a closed document.
     pub fn dropDocument(trees: *Trees, uri: []const u8) void {
         var iterator = trees.cache.iterator();
         while (iterator.next()) |entry| {
@@ -221,7 +203,6 @@ pub const Trees = struct {
         }
     }
 
-    /// Replaces the entry under `key`, or adds one with its own copy of the key.
     fn putInCache(trees: *Trees, key: []const u8, shared_tree: *SharedTree) Allocator.Error!void {
         if (trees.cache.getPtr(key)) |slot| {
             slot.*.release();

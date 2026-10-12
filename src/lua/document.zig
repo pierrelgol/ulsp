@@ -1,5 +1,3 @@
-//! Lua's view of documents: the handle userdata and the `ulsp.documents` / document methods.
-
 const convert = @import("convert.zig");
 const zlua = @import("zlua");
 const Document = @import("../text.zig").Document;
@@ -12,7 +10,6 @@ const raise = convert.raise;
 const positions = convert.positions;
 const wrap = zlua.wrap;
 
-/// The userdata behind a document handle. Holds one reference to the document.
 pub const DocumentHandle = struct {
     document: *Document,
 
@@ -34,7 +31,6 @@ pub const DocumentHandle = struct {
     }
 };
 
-/// `core.doc_get`, `core.doc_list` and the methods of document handles.
 pub const document_calls = struct {
     pub fn get(lua: *Lua) i32 {
         const runtime = Runtime.of(lua);
@@ -62,7 +58,6 @@ pub const document_calls = struct {
         return 1;
     }
 
-    /// Pushes the metatable of document handles. Methods are looked up in `__index`.
     pub fn pushMetatable(lua: *Lua) void {
         lua.createTable(0, 3);
 
@@ -88,8 +83,6 @@ pub const document_calls = struct {
         lua.setField(-2, "__gc");
     }
 
-    /// The argument at `index` as a document handle (live or snapshot). Raises if it is not one,
-    /// or when the document was closed.
     pub fn documentArgument(lua: *Lua, runtime: *Runtime, index: i32) *Document {
         if (lua.typeOf(index) != .userdata) {
             raise.text(lua, "ulsp: expected a document");
@@ -143,15 +136,12 @@ pub const document_calls = struct {
         return 1;
     }
 
-    /// `doc:snapshot()`: an immutable copy that stays valid after edits and after the document
-    /// closes.
     fn documentSnapshot(lua: *Lua) i32 {
         const runtime = Runtime.of(lua);
         const document = receiver(lua, runtime);
 
         const copy = document.snapshot() catch raise.text(lua, "out of memory");
         DocumentHandle.push(lua, runtime, copy);
-        // The handle holds its own reference.
         copy.release();
         runtime.noteNativeBytes(document.bytes().len);
 

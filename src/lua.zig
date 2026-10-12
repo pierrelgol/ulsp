@@ -1,4 +1,3 @@
-//! The Lua side of the server: the `ulsp` API, JSON conversion, and the document and tree-sitter bindings.
 pub const api = @import("lua/api.zig");
 pub const convert = @import("lua/convert.zig");
 pub const core = @import("lua/core.zig");

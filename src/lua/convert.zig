@@ -1,14 +1,10 @@
-//! The bridge between Lua and the outside: JSON <-> Lua conversion, the shape
-//! tags, JSON text validation, raising Lua errors and converting positions.
 const std = @import("std");
 const zlua = @import("zlua");
 const Document = @import("../text.zig").Document;
-
 const Lua = zlua.Lua;
 const json = std.json;
 const Allocator = std.mem.Allocator;
 
-/// Raising Lua errors. A raise longjmps over `defer`: release everything first.
 pub const raise = struct {
     pub fn text(lua: *Lua, message: []const u8) noreturn {
         _ = lua.pushString(message);
@@ -21,8 +17,6 @@ pub const raise = struct {
     }
 };
 
-/// The shape metatables that mark a Lua table as a JSON array or object, kept as registry
-/// references (never as string keys).
 pub const Tags = struct {
     array_ref: i32,
     object_ref: i32,
@@ -50,7 +44,6 @@ pub const Tags = struct {
 
     pub const Shape = enum { none, array, object };
 
-    /// The shape tag of the table at `index`, `.none` when it has another metatable or none.
     pub fn shapeOf(tags: Tags, lua: *Lua, index: i32) Shape {
         lua.getMetatable(index) catch return .none;
         defer lua.pop(1);
@@ -73,7 +66,6 @@ pub const Tags = struct {
     }
 };
 
-/// Converting `{line, character}` between Lua tables and `Document.Position`.
 pub const positions = struct {
     pub fn read(lua: *Lua, index: i32) Document.Position {
         lua.checkType(index, .table);
@@ -107,8 +99,6 @@ pub const positions = struct {
     }
 };
 
-/// Nesting limit for JSON text: bounds the stack and memory a hostile `[[[[...` input can make
-/// the parser use.
 pub const max_json_depth = 128;
 
 pub fn isNestingWithinLimit(bytes: []const u8) bool {
@@ -156,19 +146,16 @@ pub const max_depth = 64;
 
 pub const Error = error{ UnsupportedType, DepthExceeded, InvalidUtf8, OutOfMemory };
 
-/// The address of this byte is `ulsp.null`.
 const null_sentinel: u8 = 0;
 
 pub fn pushNull(lua: *Lua) void {
     lua.pushLightUserdata(&null_sentinel);
 }
 
-/// Pushes `value`. Fails, leaving the stack as it was, if nesting exceeds `max_depth`.
 pub fn push(lua: *Lua, tags: Tags, value: json.Value) Error!void {
     return pushAtDepth(lua, tags, value, 0);
 }
 
-/// Reads the Lua value at `index`. Allocates only from `arena`. Does not raise Lua errors.
 pub fn toJson(lua: *Lua, tags: Tags, arena: Allocator, index: i32) Error!json.Value {
     return toJsonAtDepth(lua, tags, arena, index, 0);
 }
@@ -255,7 +242,6 @@ fn toJsonAtDepth(lua: *Lua, tags: Tags, arena: Allocator, index: i32, depth: u32
     }
 }
 
-/// Integers stay integers; a float with an integral value becomes one; NaN and infinity are null.
 fn numberToJson(lua: *Lua, absolute_index: i32) json.Value {
     if (lua.isInteger(absolute_index)) {
         return .{ .integer = lua.toInteger(absolute_index) catch unreachable };
@@ -308,11 +294,8 @@ fn objectToJson(lua: *Lua, tags: Tags, arena: Allocator, absolute_index: i32, de
 
     lua.pushNil();
     while (lua.next(absolute_index)) {
-        // On an error the iteration is abandoned with key and value still on the stack.
         errdefer lua.pop(2);
 
-        // Key at -2, value at -1. Never call toString on a non-string key: it would convert it
-        // in place.
         if (lua.typeOf(-2) != .string) {
             return error.UnsupportedType;
         }
@@ -330,7 +313,6 @@ fn objectToJson(lua: *Lua, tags: Tags, arena: Allocator, absolute_index: i32, de
     return .{ .object = object };
 }
 
-/// True when the table holds exactly the keys 1..length.
 fn isSequence(lua: *Lua, absolute_index: i32, length: usize) bool {
     var key_count: usize = 0;
 
@@ -355,13 +337,13 @@ fn isSequence(lua: *Lua, absolute_index: i32, length: usize) bool {
 
 const testing = std.testing;
 
-const Fixture = struct {
+const CaseGenerator = struct {
     lua: *Lua,
     tags: Tags,
     arena_state: std.heap.ArenaAllocator,
 
-    fn init() !Fixture {
-        var fixture: Fixture = undefined;
+    fn init() !CaseGenerator {
+        var fixture: CaseGenerator = undefined;
         fixture.lua = try Lua.init(testing.allocator);
         fixture.lua.openLibs();
         fixture.tags = Tags.init(fixture.lua);
@@ -370,13 +352,13 @@ const Fixture = struct {
         return fixture;
     }
 
-    fn deinit(fixture: *Fixture) void {
+    fn deinit(fixture: *CaseGenerator) void {
         fixture.arena_state.deinit();
         fixture.tags.deinit(fixture.lua);
         fixture.lua.deinit();
     }
 
-    fn evaluate(fixture: *Fixture, source: [:0]const u8) !json.Value {
+    fn evaluate(fixture: *CaseGenerator, source: [:0]const u8) !json.Value {
         fixture.lua.setTop(0);
         try fixture.lua.doString(source);
 
@@ -385,16 +367,16 @@ const Fixture = struct {
 };
 
 test "JSON to Lua to JSON round trip, every row of 6.4" {
-    var fixture = try Fixture.init();
-    defer fixture.deinit();
+    var cg = try CaseGenerator.init();
+    defer cg.deinit();
 
-    const arena = fixture.arena_state.allocator();
+    const arena = cg.arena_state.allocator();
     const source =
         \\{"a":null,"b":[],"c":{},"d":[1,2.5,{"e":[{}]}],"f":"s","g":true,"h":3.0,"i":-7,"j":1e2,"k":18446744073709551616}
     ;
     const parsed = try json.parseFromSliceLeaky(json.Value, arena, source, .{});
-    try push(fixture.lua, fixture.tags, parsed);
-    const back = try toJson(fixture.lua, fixture.tags, arena, -1);
+    try push(cg.lua, cg.tags, parsed);
+    const back = try toJson(cg.lua, cg.tags, arena, -1);
 
     const object = back.object;
     try testing.expect(object.get("a").? == .null);
@@ -407,22 +389,20 @@ test "JSON to Lua to JSON round trip, every row of 6.4" {
     try testing.expect(items[2].object.get("e").?.array.items[0] == .object);
     try testing.expectEqualStrings("s", object.get("f").?.string);
     try testing.expectEqual(true, object.get("g").?.bool);
-    try testing.expectEqual(@as(i64, 3), object.get("h").?.integer); // float with integral value
+    try testing.expectEqual(@as(i64, 3), object.get("h").?.integer);
     try testing.expectEqual(@as(i64, -7), object.get("i").?.integer);
     try testing.expectEqual(@as(i64, 100), object.get("j").?.integer);
 
-    // Lua-side types: integer stays integer, 1e2 is a float, the big number is a float.
-    fixture.lua.setGlobal("v");
-    try fixture.lua.doString("assert(math.type(v.i) == 'integer' and math.type(v.h) == 'float' and math.type(v.k) == 'float')");
-    // null is truthy and is not nil
-    try fixture.lua.doString("assert(v.a ~= nil and v.a)");
+    cg.lua.setGlobal("v");
+    try cg.lua.doString("assert(math.type(v.i) == 'integer' and math.type(v.h) == 'float' and math.type(v.k) == 'float')");
+    try cg.lua.doString("assert(v.a ~= nil and v.a)");
 }
 
 test "untagged tables" {
-    var fixture = try Fixture.init();
-    defer fixture.deinit();
+    var cg = try CaseGenerator.init();
+    defer cg.deinit();
 
-    const value = try fixture.evaluate("return { seq = {1, 2, 3}, empty = {}, half = 4 / 2, nan = 0/0, inf = 1/0 }");
+    const value = try cg.evaluate("return { seq = {1, 2, 3}, empty = {}, half = 4 / 2, nan = 0/0, inf = 1/0 }");
 
     const object = value.object;
     try testing.expectEqual(@as(usize, 3), object.get("seq").?.array.items.len);
@@ -433,7 +413,7 @@ test "untagged tables" {
 }
 
 test "failure cases" {
-    var fixture = try Fixture.init();
+    var fixture = try CaseGenerator.init();
     defer fixture.deinit();
 
     try testing.expectError(error.UnsupportedType, fixture.evaluate("return { f = print }"));
@@ -446,29 +426,29 @@ test "failure cases" {
 }
 
 test "tagged empty tables" {
-    var fixture = try Fixture.init();
-    defer fixture.deinit();
+    var cg = try CaseGenerator.init();
+    defer cg.deinit();
 
-    fixture.lua.setTop(0);
-    fixture.lua.createTable(0, 0);
-    fixture.tags.push(fixture.lua, true);
-    fixture.lua.setMetatable(-2);
-    const array = try toJson(fixture.lua, fixture.tags, fixture.arena_state.allocator(), -1);
+    cg.lua.setTop(0);
+    cg.lua.createTable(0, 0);
+    cg.tags.push(cg.lua, true);
+    cg.lua.setMetatable(-2);
+    const array = try toJson(cg.lua, cg.tags, cg.arena_state.allocator(), -1);
     try testing.expect(array == .array);
 
-    fixture.lua.pop(1);
-    fixture.lua.createTable(0, 0);
-    fixture.tags.push(fixture.lua, false);
-    fixture.lua.setMetatable(-2);
-    const object = try toJson(fixture.lua, fixture.tags, fixture.arena_state.allocator(), -1);
+    cg.lua.pop(1);
+    cg.lua.createTable(0, 0);
+    cg.tags.push(cg.lua, false);
+    cg.lua.setMetatable(-2);
+    const object = try toJson(cg.lua, cg.tags, cg.arena_state.allocator(), -1);
     try testing.expect(object == .object);
 }
 
 test "push depth limit" {
-    var fixture = try Fixture.init();
-    defer fixture.deinit();
+    var cg = try CaseGenerator.init();
+    defer cg.deinit();
 
-    const arena = fixture.arena_state.allocator();
+    const arena = cg.arena_state.allocator();
     var text: std.ArrayList(u8) = .empty;
     for (0..70) |_| {
         try text.append(arena, '[');
@@ -478,8 +458,8 @@ test "push depth limit" {
     }
 
     const value = try json.parseFromSliceLeaky(json.Value, arena, text.items, .{ .max_value_len = null });
-    fixture.lua.setTop(0);
+    cg.lua.setTop(0);
 
-    try testing.expectError(error.DepthExceeded, push(fixture.lua, fixture.tags, value));
-    try testing.expectEqual(@as(i32, 0), fixture.lua.getTop());
+    try testing.expectError(error.DepthExceeded, push(cg.lua, cg.tags, value));
+    try testing.expectEqual(@as(i32, 0), cg.lua.getTop());
 }

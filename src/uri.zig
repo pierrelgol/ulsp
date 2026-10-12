@@ -1,17 +1,13 @@
 const std = @import("std");
-
 const Allocator = std.mem.Allocator;
-
 pub const file_scheme = "file://";
 
-/// Path of a `file://` URI, percent-decoded. Null for any other scheme.
 pub fn toPath(gpa: Allocator, uri: []const u8) Allocator.Error!?[]u8 {
     if (!std.mem.startsWith(u8, uri, file_scheme)) {
         return null;
     }
     var rest = uri[file_scheme.len..];
 
-    // RFC 8089: the authority is empty or `localhost`; any other host is not a local path.
     if (std.mem.startsWith(u8, rest, "localhost/")) {
         rest = rest["localhost".len..];
     }
@@ -26,7 +22,6 @@ pub fn toPath(gpa: Allocator, uri: []const u8) Allocator.Error!?[]u8 {
     return try gpa.dupe(u8, path);
 }
 
-/// `file://` URI of an absolute path, percent-encoded (everything but unreserved and `/`).
 pub fn fromPath(gpa: Allocator, path: []const u8) Allocator.Error![]u8 {
     var output: std.Io.Writer.Allocating = .init(gpa);
     errdefer output.deinit();

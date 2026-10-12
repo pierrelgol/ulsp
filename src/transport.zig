@@ -1,5 +1,3 @@
-//! Both directions of the client channel: the reader worker feeding the queue
-//! and the writer worker behind the output.
 const std = @import("std");
 const lsp = @import("lsp");
 const operations = @import("ops.zig");
@@ -8,14 +6,9 @@ const c = std.c;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-/// Only the loop thread pushes; a client slow to read never stalls the loop. Messages wait
-/// in a queue, capped by `ClientWriter.max_pending_bytes` (beyond it new messages are dropped and logged).
 pub const ClientWriter = struct {
     pub const max_pending_bytes = 64 * 1024 * 1024;
-
-    /// How long `finish` lets the client take the queued output.
     pub const flush_timeout_ms = 2000;
-
     const queue_capacity = 4096;
 
     const Finished = union(enum) { writer: void, timeout: void };
@@ -35,13 +28,11 @@ pub const ClientWriter = struct {
         try writer.finished.concurrent(.writer, writeUntilClosed, .{ writer, io });
     }
 
-    /// Queues a copy of `bytes`. A message that cannot be copied or exceeds the cap is dropped.
     pub fn push(writer: *ClientWriter, io: Io, bytes: []const u8) void {
         const message = writer.gpa.dupe(u8, bytes) catch return;
         writer.pushOwned(io, message);
     }
 
-    /// Queues `message`, allocated with `writer.gpa`; same drop rules as `push`.
     pub fn pushOwned(writer: *ClientWriter, io: Io, message: []u8) void {
         const pending_after_push = writer.pending_bytes.fetchAdd(message.len, .monotonic) + message.len;
         if (pending_after_push <= ClientWriter.max_pending_bytes) {
@@ -54,15 +45,12 @@ pub const ClientWriter = struct {
         _ = writer.pending_bytes.fetchSub(message.len, .monotonic);
         writer.dropped_count += 1;
 
-        // A dropped reply leaves its request unanswered: say so, once.
         if (writer.dropped_count == 1 and !@import("builtin").is_test) {
             writeStderrNonBlocking("ulsp [error] client is not reading: output is being dropped\n");
         }
         writer.gpa.free(message);
     }
 
-    /// Writes what is queued, then stops the worker. A client that stops reading cannot hold the
-    /// exit: after `flush_timeout_ms` the blocked write is canceled and the rest is dropped.
     pub fn finish(writer: *ClientWriter, io: Io) void {
         writer.queue.close(io);
         writer.finished.concurrent(.timeout, sleepUntilFlushDeadline, .{io}) catch {};
@@ -86,13 +74,10 @@ pub const ClientWriter = struct {
     fn writeUntilClosed(writer: *ClientWriter, io: Io) void {
         var client_alive = true;
 
-        // Ends on Closed once the queue is drained, or on Canceled when `finish` gave up.
         while (writer.queue.getOne(io)) |message| {
             defer writer.gpa.free(message);
             _ = writer.pending_bytes.fetchSub(message.len, .monotonic);
 
-            // A write failure means the client is gone (the reader reports that as eof); the rest
-            // is then dropped.
             if (client_alive) {
                 writer.transport.writeJsonMessage(io, message) catch {
                     client_alive = false;
@@ -102,7 +87,6 @@ pub const ClientWriter = struct {
     }
 };
 
-/// Sends every message, then `eof` once, unless it was canceled.
 pub fn readLoop(io: std.Io, gpa: std.mem.Allocator, transport: *lsp.Transport, queue: *operations.EventQueue) void {
     while (true) {
         const bytes = transport.readJsonMessage(io, gpa) catch |err| {
@@ -143,12 +127,10 @@ test "output over the cap is dropped and counted" {
     writer.discardQueued(std.testing.io);
 }
 
-/// The client channel, moved off fd 0 and fd 1 by `isolateProtocolStreams`.
 pub const ProtocolStreams = struct {
     input: std.Io.File,
     output: std.Io.File,
 
-    /// Both handles are plain blocking files: the transport owns the reading and writing policy.
     pub fn fromHandles(input_handle: std.Io.File.Handle, output_handle: std.Io.File.Handle) ProtocolStreams {
         return .{
             .input = .{ .handle = input_handle, .flags = .{ .nonblocking = false } },
@@ -159,12 +141,9 @@ pub const ProtocolStreams = struct {
 
 pub const IsolateError = error{IsolateFailed};
 
-/// A pipe accepts a write up to PIPE_BUF whole when poll says it is writable.
 const max_stderr_line_bytes = 4096;
 const first_private_descriptor: c_int = 3;
 
-/// Moves the protocol channel onto private close-on-exec descriptors, then points
-/// fd 0 at /dev/null and fd 1 at stderr so nothing else can corrupt the protocol stream.
 pub fn isolateProtocolStreams() IsolateError!ProtocolStreams {
     const input_fd = c.fcntl(0, c.F.DUPFD_CLOEXEC, first_private_descriptor);
     if (input_fd < 0) {
@@ -192,8 +171,6 @@ pub fn isolateProtocolStreams() IsolateError!ProtocolStreams {
     return .fromHandles(input_fd, output_fd);
 }
 
-/// Writes one line to stderr without ever blocking: dropped when nobody reads it. A line longer
-/// than `max_stderr_line_bytes` is cut to that.
 pub fn writeStderrNonBlocking(line: []const u8) void {
     var poll_descriptor: c.pollfd = .{ .fd = 2, .events = c.POLL.OUT, .revents = 0 };
     const ready_count = c.poll(@ptrCast(&poll_descriptor), 1, 0);
