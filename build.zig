@@ -25,6 +25,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const git2_dep = b.dependency("libgit2", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const sqlite3_lib = b.dependency("sqlite3", .{
+        .target = target,
+        .optimize = optimize,
+    }).artifact("sqlite3");
+    const sqlite3_c = b.addTranslateC(.{
+        .root_source_file = sqlite3_lib.getEmittedIncludeTree().path(b, "sqlite3.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const sqlite3_mod = sqlite3_c.createModule();
+    sqlite3_mod.linkLibrary(sqlite3_lib);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -35,6 +52,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zlua", .module = lua_dep.module("zlua") },
             .{ .name = "lsp", .module = lsp_dep.module("lsp") },
             .{ .name = "zts", .module = zts_dep.module("tree_sitter") },
+            .{ .name = "git2", .module = git2_dep.module("git2") },
+            .{ .name = "sqlite3", .module = sqlite3_mod },
         },
     });
 

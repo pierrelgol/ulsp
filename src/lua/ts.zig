@@ -557,7 +557,7 @@ pub const ts_calls = struct {
         registerMetatable(lua, QueryBox.metatable_name, query_calls.methods, QueryBox.release, null);
     }
 
-    fn registerMetatable(lua: *Lua, name: [:0]const u8, comptime methods: anytype, comptime gc: anytype, comptime equal: anytype) void {
+    pub fn registerMetatable(lua: *Lua, name: [:0]const u8, comptime methods: anytype, comptime gc: anytype, comptime equal: anytype) void {
         lua.newMetatable(name) catch unreachable;
 
         lua.createTable(0, methods.len);

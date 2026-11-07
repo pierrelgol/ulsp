@@ -2,6 +2,8 @@ const convert = @import("convert.zig");
 const api = @import("api.zig");
 pub const document_calls = @import("document.zig").document_calls;
 const ts_calls = @import("ts.zig").ts_calls;
+const git_calls = @import("git.zig").git_calls;
+const sqlite_calls = @import("sqlite.zig").sqlite_calls;
 const client_calls = api.client_calls;
 const json_calls = api.json_calls;
 const operation_calls = api.operation_calls;
@@ -43,6 +45,8 @@ pub fn push(lua: *Lua) void {
     }
 
     ts_calls.register(lua);
+    git_calls.register(lua);
+    sqlite_calls.register(lua);
     convert.pushNull(lua);
     lua.setField(-2, "null");
 }

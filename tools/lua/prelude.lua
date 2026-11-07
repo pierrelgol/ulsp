@@ -24,6 +24,9 @@ local ulsp = {
     load = core.ts_load, language = core.ts_language, parse = core.ts_parse,
     tree = core.ts_tree, query = core.ts_query,
   },
+  -- Synchronous: each call blocks the server until it returns.
+  git = { open = core.git_open },
+  sqlite = { open = core.sqlite_open },
   rpc = {},
   log = {},
   process = {},

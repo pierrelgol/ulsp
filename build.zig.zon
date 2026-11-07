@@ -24,6 +24,14 @@
             .url = "https://github.com/neurocyte/tree-sitter/releases/download/zig-0.16-b3effa2d11a93447516781273a88ba621cc2617d/source.tar.gz",
             .hash = "tree_sitter-0.26.7-z0LhyBp76zOKagDB_wh0Cv10DpWo-dAK9DkCio_GahLP",
         },
+        .libgit2 = .{
+            .url = "git+https://github.com/allyourcodebase/libgit2.git#71b31daa7dcc9b93fd384c89faaf78ca5e80287c",
+            .hash = "libgit2-1.0.0+1.9.0-uizqTcz9AAA2-MOhcr6sAqboJSRZHMovFy4sobhsOYA8",
+        },
+        .sqlite3 = .{
+            .url = "git+https://github.com/allyourcodebase/sqlite3#7a615f5af79009cd733e3480658586d9b0d28b35",
+            .hash = "sqlite3-3.53.2-DMxLWuAOAAA_Px0arJOIOaP4AKEu5prbsQgPMA35W1zz",
+        },
     },
     .paths = .{
         "build.zig",
